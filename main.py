@@ -1,0 +1,221 @@
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import argparse
+import zipfile
+import io
+import shutil
+import csv
+from urllib.request import urlopen
+from urllib.error import URLError, HTTPError
+from moduls.camera import load_camera_params, load_superglue_model
+from moduls.data_processing import process_imu_data
+from moduls.visualization import visualize_results, visualize_error, visualize_superglue
+from moduls.confidence_estimation import quadratic_unit_step, cubic_unit_step, quartic_unit_step, relu, exponential_sigmoid, double_exponential_sigmoid, step
+
+DEFAULT_DATASET = "EurocMav"
+DEFAULT_SEQUENCE = "MH_04_difficult"
+BASE_URL = "http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/machine_hall/"
+
+def download_dataset(sequence_name, dataset_path):
+    download_url = f"{BASE_URL}{sequence_name}/{sequence_name}.zip"
+    zip_path = Path(dataset_path) / f"{sequence_name}.zip"
+    extract_path = Path(dataset_path) / sequence_name
+    
+    print(f"Attempting to download from: {download_url}")
+    
+    try:
+        with urlopen(download_url) as response:
+            total_size = int(response.info().get('Content-Length', -1))
+            
+            if total_size < 0:
+                print("Unable to determine file size. Downloading without progress indication.")
+                data = response.read()
+            else:
+                data = io.BytesIO()
+                with tqdm(total=total_size, unit='B', unit_scale=True, desc="Downloading") as pbar:
+                    while True:
+                        chunk = response.read(8192)
+                        if not chunk:
+                            break
+                        data.write(chunk)
+                        pbar.update(len(chunk))
+                data = data.getvalue()
+
+            print("\nDownload complete. Saving and verifying file...")
+            
+            with open(zip_path, 'wb') as f:
+                f.write(data)
+            
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    print("File verified as a valid zip file. Extracting...")
+                    zf.extractall(extract_path)
+                print("Extraction complete.")
+                return True
+            except zipfile.BadZipFile:
+                print("Error: Downloaded file is not a valid zip file.")
+                return False
+    
+    except HTTPError as e:
+        print(f"HTTP Error during download: {e.code} {e.reason}")
+        return False
+    except URLError as e:
+        print(f"URL Error during download: {e.reason}")
+        return False
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return False
+
+def preprocess_imu_data(base_path):
+    try:
+        imu_file = base_path / 'imu0' / 'data.csv'
+        groundtruth_file = base_path / 'state_groundtruth_estimate0' / 'data.csv'
+        
+        if not imu_file.exists():
+            raise FileNotFoundError(f"IMU data file not found: {imu_file}")
+        if not groundtruth_file.exists():
+            raise FileNotFoundError(f"Groundtruth data file not found: {groundtruth_file}")
+        
+        imu_df = pd.read_csv(imu_file)
+        groundtruth_df = pd.read_csv(groundtruth_file)
+        
+        # Find the timestamp column
+        timestamp_col = next((col for col in groundtruth_df.columns if 'timestamp' in col.lower()), None)
+        if timestamp_col is None:
+            raise ValueError("Timestamp column not found in groundtruth data")
+        
+        groundtruth_df.set_index(timestamp_col, inplace=True)
+        groundtruth_df.sort_index(inplace=True)
+        
+        velocity_cols = [col for col in groundtruth_df.columns if 'v_RS_R_' in col]
+        quaternion_cols = [col for col in groundtruth_df.columns if 'q_RS_' in col]
+        
+        if not velocity_cols or not quaternion_cols:
+            raise ValueError("Velocity or quaternion columns not found in groundtruth data")
+        
+        for col in velocity_cols + quaternion_cols:
+            imu_df[col] = np.interp(imu_df[imu_df.columns[0]], 
+                                    groundtruth_df.index.values, 
+                                    groundtruth_df[col].values)
+        
+        output_file = base_path / 'imu0' / 'imu_with_interpolated_groundtruth.csv'
+        imu_df.to_csv(output_file, index=False)
+        print(f"Preprocessed IMU data saved to: {output_file}")
+    except Exception as e:
+        print(f"An error occurred during preprocessing: {e}")
+        raise
+
+def main(args):
+    dataset_path = Path(args.dataset_path)
+    sequence_path = dataset_path / args.sequence
+    
+    if args.download or not sequence_path.exists():
+        success = download_dataset(args.sequence, dataset_path)
+        if not success:
+            print("Failed to download or extract the dataset. Exiting.")
+            return
+
+    base_path = sequence_path / 'mav0'
+    
+    if not base_path.exists():
+        print(f"Dataset structure not found at {base_path}. Please check the dataset path.")
+        return
+
+    imu_file_path = base_path / 'imu0' / 'data.csv'
+    camera_file_path = base_path / 'cam0' / 'data.csv'
+    camera_data_path = base_path / 'cam0' / 'data'
+    camera_yaml_path = base_path / 'cam0' / 'sensor.yaml'
+
+    # Check if all required files exist
+    required_files = [imu_file_path, camera_file_path, camera_yaml_path]
+    for file in required_files:
+        if not file.exists():
+            print(f"Required file not found: {file}")
+            return
+
+    if not camera_data_path.exists():
+        print(f"Camera data directory not found: {camera_data_path}")
+        return
+
+    activation_functions = {
+        'quadratic_unit_step': quadratic_unit_step,
+        'cubic_unit_step': cubic_unit_step,
+        'quartic_unit_step': quartic_unit_step,
+        'relu': relu,
+        'exponential_sigmoid': exponential_sigmoid,
+        'double_exponential_sigmoid': double_exponential_sigmoid,
+        'step': step
+    }
+
+    config = {
+        'alpha': args.alpha,
+        'beta': args.beta,
+        'gamma': args.gamma,
+        'theta_threshold': args.theta_threshold,
+        'activation_func': activation_functions[args.activation_function],
+        'generate_superglue_visualizations': args.generate_superglue_visualizations,
+        'superglue': {
+            'weights': 'indoor',
+            'sinkhorn_iterations': 20,
+            'match_threshold': 0.2,
+            'keypoint_threshold': 0.005,
+            'max_keypoints': 1000,
+            'nms_radius': 4
+        },
+        'superglue_visualization': {
+            'frame_interval': 50,
+            'max_pairs': 5000
+        }
+    }
+
+    print("Preprocessing IMU data...")
+    preprocess_imu_data(base_path)
+
+    imu_with_groundtruth_path = base_path / 'imu0' / 'imu_with_interpolated_groundtruth.csv'
+    
+    print("Starting VIO processing...")
+    try:
+        data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles, rmse_quaternions, rmse_euler_angles, thetas, timestamps = process_imu_data(
+            str(imu_with_groundtruth_path), str(camera_file_path), str(camera_data_path), str(camera_yaml_path), config)
+        print("Quaternion RMSE:", rmse_quaternions)
+        print("Euler Angle RMSE:", rmse_euler_angles)
+        
+        # CSV dosyasına yazma işlemi
+        output_file = 'estimated_values.csv'
+        with open(output_file, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['Timestamp', 'q_w', 'q_x', 'q_y', 'q_z', 'roll', 'pitch', 'yaw', 'theta'])
+            for t, q, e, theta in zip(timestamps, aligned_quaternions, aligned_euler_angles, thetas):
+                writer.writerow([t] + list(q) + list(e) + [theta])
+        print(f"Estimated values saved to {output_file}")
+        
+        print("Generating visualizations...")
+        visualize_results(data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles, rmse_quaternions, rmse_euler_angles, thetas)
+        visualize_error(data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles)
+        
+        if config['generate_superglue_visualizations']:
+            print("Generating SuperGlue visualizations...")
+            visualize_superglue(base_path, 'super-out', config)
+        
+        print("VIO processing completed successfully.")
+    except Exception as e:
+        print(f"An error occurred during VIO processing: {e}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Visual Inertial Odometry Processing")
+    parser.add_argument("--dataset_path", type=str, default=".", help="Path to save the dataset (default: current directory)")
+    parser.add_argument("--sequence", type=str, default=DEFAULT_SEQUENCE, help=f"Dataset sequence to use (default: {DEFAULT_SEQUENCE})")
+    parser.add_argument("--download", action="store_true", help="Force download the dataset even if it exists")
+    parser.add_argument("--alpha", type=float, default=3, help="Alpha parameter (default: 3)")
+    parser.add_argument("--beta", type=float, default=1, help="Beta parameter (default: 1)")
+    parser.add_argument("--gamma", type=float, default=1, help="Gamma parameter (default: 1)")
+    parser.add_argument("--theta_threshold", type=float, default=0.3, help="Theta threshold (default: 0.3)")
+    parser.add_argument("--activation_function", type=str, choices=['quadratic_unit_step', 'cubic_unit_step', 'quartic_unit_step', 'relu', 'exponential_sigmoid', 'double_exponential_sigmoid', 'step'], default='double_exponential_sigmoid', help="Activation function to use (default: double_exponential_sigmoid)")
+    parser.add_argument("--generate_superglue_visualizations", action="store_true", help="Generate SuperGlue visualizations")
+    
+    args = parser.parse_args()
+    main(args)

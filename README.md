@@ -19,23 +19,32 @@ This project implements an Adaptive Visual-Inertial Odometry (VIO) system using 
    cd adaptive-vio-superglue
    ```
 
+
+
+
+
 2. Install PyTorch:
    
    For CPU-only:
    ```
-   pip install torch torchvision torchaudio
+   pip3 install torch torchvision torchaudio
    ```
    
    For GPU (CUDA) support:
    ```
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+   pip3 install torch torchvision torchaudio --index-url --index-url https://download.pytorch.org/whl/cu118
    ```
-   Note: Replace `cu118` with your CUDA version if different.
+   Note: Replace `cu118` with your CUDA version if different.   Please visit https://pytorch.org/get-started/locally/ for different installations
 
 3. Install the required dependencies:
    ```
    pip install -r requirements.txt
    ```
+
+
+
+
+
 
 ## Usage
 
@@ -50,7 +59,7 @@ python main.py [OPTIONS]
 - `--dataset_path`: Path to save the dataset (default: current directory)
 - `--sequence`: Dataset sequence to use (default: MH_04_difficult)
 - `--download`: Force download the dataset even if it exists
-- `--alpha`: Alpha parameter for confidence estimation (default: 3)
+- `--alpha`: Alpha parameter for confidence estimation (default: 1)
 - `--beta`: Beta parameter for confidence estimation (default: 1)
 - `--gamma`: Gamma parameter for confidence estimation (default: 1)
 - `--theta_threshold`: Theta threshold for adaptive fusion (default: 0.3)
@@ -99,7 +108,7 @@ Contributions to improve the system or add new features are welcome. Please feel
 
 ## License
 
-[Specify your license here]
+MIT Licence
 
 ## Citation
 
