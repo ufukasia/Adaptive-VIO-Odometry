@@ -3,39 +3,38 @@ from scipy.spatial.transform import Rotation
 import cv2
 
 class ExtendedKalmanFilter:
-    def __init__(self, initial_quaternion, camera_matrix, dist_coeffs):
+    def __init__(self, initial_quaternion, camera_matrix, dist_coeffs, theta_threshold):
         self.q = initial_quaternion
         self.P = np.diag([0.001, 0.001, 0.001, 0.001])
         self.Q = np.diag([1e-10, 1e-10, 1e-10, 1e-10])
         self.R_camera = np.diag([0.09, 0.09])
         self.R_imu = np.diag([0.001, 0.001, 0.001, 0.001, 0.001, 0.001])
+        self.theta_threshold = theta_threshold  # Initialize theta_threshold as an instance variable
         self.camera_matrix = camera_matrix
         self.dist_coeffs = dist_coeffs
 
     def update(self, gyroscope, accelerometer, image_points, world_points, dt, theta):
         q = self.q
-
         if np.all(accelerometer == 0) and np.all(gyroscope == 0):
             return self.q
-
         if np.linalg.norm(accelerometer) != 0:
             accelerometer = accelerometer / np.linalg.norm(accelerometer)
-
         q_pred = self.predict(q, gyroscope, dt)
-
-        if theta > 0.45:  # Theta çok yüksekse sadece IMU kullan
+        
+        deadline = 0.5  # This could also be made configurable if needed
+        
+        if theta > deadline:  # Theta çok yüksekse sadece IMU kullan
             self.q = self.update_imu_only(q_pred, gyroscope, accelerometer)
         elif image_points is not None and world_points is not None and len(image_points) >= 4:
-            if theta <= 0.3:  # Düşük theta değeri için tam kamera güncellemesi
+            if theta <= self.theta_threshold:  # Düşük theta değeri için tam kamera güncellemesi
                 self.q = self.update_with_camera(q_pred, image_points, world_points, gyroscope, accelerometer)
             else:  # Orta theta değerleri için ağırlıklı ortalama
-                camera_reliability = max(0, (0.5 - theta) / 0.2)  # 0.3 ile 0.5 arasında lineer azalma
+                camera_reliability = max(0, (deadline - theta) / (deadline - self.theta_threshold))
                 q_camera = self.update_with_camera(q_pred, image_points, world_points, gyroscope, accelerometer)
                 q_imu = self.update_imu_only(q_pred, gyroscope, accelerometer)
                 self.q = self.weighted_quaternion_average([q_camera, q_imu], [camera_reliability, 1 - camera_reliability])
         else:
             self.q = self.update_imu_only(q_pred, gyroscope, accelerometer)
-
         return self.q
 
     def predict(self, q, gyroscope, dt):

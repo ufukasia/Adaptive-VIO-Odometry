@@ -35,7 +35,10 @@ def process_imu_data(imu_file_path, camera_file_path, camera_data_path, camera_y
         for key in calibration:
             imu_data[key] = imu_data[key] - calibration[key]
 
-        ekf = ExtendedKalmanFilter(initial_quaternion=initial_quaternion, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
+        ekf = ExtendedKalmanFilter(initial_quaternion=initial_quaternion, 
+                                   camera_matrix=camera_matrix, 
+                                   dist_coeffs=dist_coeffs,
+                                   theta_threshold=config['theta_threshold'])
 
         estimated_quaternions = []
         estimated_euler_angles = []

@@ -210,7 +210,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_path", type=str, default=".", help="Path to save the dataset (default: current directory)")
     parser.add_argument("--sequence", type=str, default=DEFAULT_SEQUENCE, help=f"Dataset sequence to use (default: {DEFAULT_SEQUENCE})")
     parser.add_argument("--download", action="store_true", help="Force download the dataset even if it exists")
-    parser.add_argument("--alpha", type=float, default=3, help="Alpha parameter (default: 3)")
+    parser.add_argument("--alpha", type=float, default=1, help="Alpha parameter (default: 1")
     parser.add_argument("--beta", type=float, default=1, help="Beta parameter (default: 1)")
     parser.add_argument("--gamma", type=float, default=1, help="Gamma parameter (default: 1)")
     parser.add_argument("--theta_threshold", type=float, default=0.3, help="Theta threshold (default: 0.3)")
