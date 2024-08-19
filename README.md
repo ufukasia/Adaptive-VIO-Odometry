@@ -16,7 +16,7 @@ This project implements an Adaptive Visual-Inertial Odometry (VIO) system using 
 1. Clone this repository:
    ```
    git clone https://github.com/ufukasia/Adaptive-VIO-Odometry.git
-   cd Adaptive-VIO-Odometri
+   cd Adaptive-VIO-Odometry
    ```
 
 
