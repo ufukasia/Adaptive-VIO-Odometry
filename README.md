@@ -1,5 +1,17 @@
 # Adaptive Visual-Inertial Odometry Using SuperGlue and Dynamic EKF
 
+ATTENTION: COPYRIGHT NOTICE
+
+The code and content in this repository belong to an unpublished academic article. All rights reserved. Any copying, distribution, reproduction, or use of this content in any form without explicit written permission is strictly prohibited. This material is for informational purposes only and should be kept confidential until the article is published.
+
+Violations will be subject to legal action under copyright laws.
+
+© 2024 Ufuk ASIL. All rights reserved.
+
+
+
+
+
 This project implements an Adaptive Visual-Inertial Odometry (VIO) system using SuperGlue for feature matching and a Dynamic Extended Kalman Filter (EKF) with Information-Based Confidence Estimation. The system is designed to provide robust and accurate pose estimation in challenging environments.
 
 ## Features
