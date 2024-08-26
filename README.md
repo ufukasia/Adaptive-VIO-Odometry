@@ -9,8 +9,8 @@ Violations will be subject to legal action under copyright laws.
 © 2024 Ufuk ASIL. All rights reserved.
 
 
-#Flowchart
-diagram.png
+# Flowchart of our algoritm
+
 ![Flowchart](diagram.png)
 
 
@@ -117,11 +117,10 @@ The script will generate the following outputs:
 - Visualization plots for quaternions, Euler angles, and errors
 - SuperGlue visualizations (if enabled)
 
-# Test
+# Test of our Algorithm
 
 When you set the value of "theta_threshold" above "1", kinformation-based confidence is disabled.
-
-
+![Test of our Algorithm](error_score_plots.png)
 
 
 
