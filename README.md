@@ -9,6 +9,9 @@ Violations will be subject to legal action under copyright laws.
 © 2024 Ufuk ASIL. All rights reserved.
 
 
+#Flowchart
+diagram.png
+![Flowchart](diagram.png)
 
 
 
