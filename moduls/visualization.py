@@ -7,54 +7,60 @@ import matplotlib.cm as cm
 from models.matching import Matching
 from models.utils import frame2tensor
 
-def visualize_results(data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles, rmse_quaternions, rmse_euler_angles, thetas):
-    fig, axs = plt.subplots(5, 2, figsize=(15, 25))
-    fig.suptitle('Quaternion, Euler Angle, and Theta Comparison (Adaptive EKF with SuperGlue)', fontsize=16)
+# Try setting a different backend for matplotlib
+plt.switch_backend('TkAgg')
+
+def visualize_results(data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles, rmse_quaternions, rmse_euler_angles, thetas, sequence_name):
+    fig, axs = plt.subplots(4, 2, figsize=(15, 20))
+    fig.suptitle('Pose Estimation Errors', fontsize=16, fontweight='bold', color='darkblue', fontfamily='serif')
 
     q_labels = ['w', 'x', 'y', 'z']
     for i, label in enumerate(q_labels):
         time = data['timestamp'][:len(aligned_quaternions)]
         
-        axs[i, 0].plot(time[::50], aligned_quaternions[::50, i], label='Estimated', color='blue')
-        axs[i, 0].plot(time[::50], true_quaternions[::50, i], label='True', color='red', linestyle='--')
+        ax1 = axs[i, 0]
+        ax1.plot(time[::50], aligned_quaternions[::50, i], label='Estimated', color='blue')
+        ax1.plot(time[::50], true_quaternions[::50, i], label='True', color='red', linestyle='--')
         
-        axs[i, 0].set_title(f'Quaternion {label} (RMSE: {rmse_quaternions[i]:.4f})')
-        axs[i, 0].set_xlabel('Time')
-        axs[i, 0].set_ylabel(f'q_{label}')
-        axs[i, 0].legend()
-        axs[i, 0].grid(True, linestyle='--', alpha=0.7)
+        ax1.set_title(f'Quaternion {label} (RMSE: {rmse_quaternions[i]:.4f})')
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel(f'q_{label}')
+        ax1.legend()
+        ax1.grid(True, linestyle='--', alpha=0.7)
+
+        ax2 = ax1.twinx()
+        ax2.plot(time[::50], thetas[::50], label='Theta', color='green', alpha=0.5)
+        ax2.set_ylabel('Theta', color='green')
+        ax2.tick_params(axis='y', labelcolor='green')
 
     euler_labels = ['Roll', 'Pitch', 'Yaw']
     for i, label in enumerate(euler_labels):
-        axs[i, 1].plot(data['timestamp'][:len(aligned_euler_angles):50], aligned_euler_angles[::50, i], label='Estimated', color='blue')
-        axs[i, 1].plot(data['timestamp'][:len(true_euler_angles):50], true_euler_angles[::50, i], label='True', color='red', linestyle='--')
-        axs[i, 1].set_title(f'{label} (RMSE: {rmse_euler_angles[i]:.4f})')
-        axs[i, 1].set_xlabel('Time')
-        axs[i, 1].set_ylabel('Angle (degrees)')
-        axs[i, 1].legend()
-        axs[i, 1].grid(True, linestyle='--', alpha=0.7)
+        ax1 = axs[i, 1]
+        ax1.plot(data['timestamp'][:len(aligned_euler_angles):50], aligned_euler_angles[::50, i], label='Estimated', color='blue')
+        ax1.plot(data['timestamp'][:len(true_euler_angles):50], true_euler_angles[::50, i], label='True', color='red', linestyle='--')
+        ax1.set_title(f'{label} (RMSE: {rmse_euler_angles[i]:.4f})')
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel('Angle (degrees)')
+        ax1.legend()
+        ax1.grid(True, linestyle='--', alpha=0.7)
 
-    # Theta plot
-    axs[4, 0].plot(data['timestamp'][:len(thetas):50], thetas[::50], label='Theta', color='green')
-    axs[4, 0].set_title('Theta (Confidence Measure)')
-    axs[4, 0].set_xlabel('Time')
-    axs[4, 0].set_ylabel('Theta')
-    axs[4, 0].legend()
-    axs[4, 0].grid(True, linestyle='--', alpha=0.7)
+        ax2 = ax1.twinx()
+        ax2.plot(data['timestamp'][:len(thetas):50], thetas[::50], label='Theta', color='green', alpha=0.5)
+        ax2.set_ylabel('Theta', color='green')
+        ax2.tick_params(axis='y', labelcolor='green')
 
-    # Histogram of theta values
-    axs[4, 1].hist(thetas, bins=50, color='green', alpha=0.7)
-    axs[4, 1].set_title('Histogram of Theta Values')
-    axs[4, 1].set_xlabel('Theta')
-    axs[4, 1].set_ylabel('Frequency')
-    axs[4, 1].grid(True, linestyle='--', alpha=0.7)
+    non_zero_thetas = thetas[thetas != 0]
+    axs[3, 1].hist(non_zero_thetas, bins=50, color='green', alpha=0.7)
+    axs[3, 1].set_title('Histogram of Non-Zero Theta Values')
+    axs[3, 1].set_xlabel('Theta')
+    axs[3, 1].set_ylabel('Frequency')
+    axs[3, 1].grid(True, linestyle='--', alpha=0.7)
 
     plt.tight_layout()
-    plt.savefig('adaptive_vio_results.png')
-    plt.close(fig)
-    print("Results plot saved as 'adaptive_vio_results.png'")
+    plt.show()
+    print(f"Results plot displayed for {sequence_name}")
 
-def visualize_error(data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles):
+def visualize_error(data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles, thetas, sequence_name):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
     fig.suptitle('Quaternion and Euler Angle Error Over Time', fontsize=16)
 
@@ -65,24 +71,31 @@ def visualize_error(data, aligned_quaternions, aligned_euler_angles, true_quater
     ax1.plot(data['timestamp'][:len(q_error):50], q_error[::50, 3], label='z', color='purple')
     ax1.set_xlabel('Time')
     ax1.set_ylabel('Quaternion Error')
-    ax1.set_title('Quaternion Error Over Time')
     ax1.legend()
     ax1.grid(True)
+
+    ax1_twin = ax1.twinx()
+    ax1_twin.plot(data['timestamp'][:len(thetas):50], thetas[::50], label='Theta', color='orange', alpha=0.5)
+    ax1_twin.set_ylabel('Theta', color='orange')
+    ax1_twin.tick_params(axis='y', labelcolor='orange')
 
     euler_error = np.abs(aligned_euler_angles - true_euler_angles)
     ax2.plot(data['timestamp'][:len(euler_error):50], euler_error[::50, 0], label='Roll', color='red')
     ax2.plot(data['timestamp'][:len(euler_error):50], euler_error[::50, 1], label='Pitch', color='green')
     ax2.plot(data['timestamp'][:len(euler_error):50], euler_error[::50, 2], label='Yaw', color='blue')
     ax2.set_xlabel('Time')
-    ax2.set_ylabel('Euler Angle Error (degrees)')
-    ax2.set_title('Euler Angle Error Over Time')
+    ax2.set_ylabel('Euler Angle Error\n(degrees)')
     ax2.legend()
     ax2.grid(True)
 
+    ax2_twin = ax2.twinx()
+    ax2_twin.plot(data['timestamp'][:len(thetas):50], thetas[::50], label='Theta', color='orange', alpha=0.5)
+    ax2_twin.set_ylabel('Theta', color='orange')
+    ax2_twin.tick_params(axis='y', labelcolor='orange')
+
     plt.tight_layout()
-    plt.savefig('adaptive_vio_error.png')
-    plt.close(fig)
-    print("Error plot saved as 'adaptive_vio_error.png'")
+    plt.show()
+    print(f"Error plot displayed for {sequence_name}")
 
 def make_matching_plot_fast(image0, image1, kpts0, kpts1, mkpts0, mkpts1, color, text, path=None, show_keypoints=False, margin=10, keypoint_size=5):
     H0, W0 = image0.shape
@@ -161,7 +174,7 @@ def process_image_pair(image1_path, image2_path, matching, device):
 def visualize_superglue(base_path, output_path, config):
     camera_data_path = base_path / 'cam0/data'
     output_path = Path(output_path)
-    output_path.mkdir(exist_ok=True)
+    output_path.mkdir(parents=True, exist_ok=True)
 
     image_paths = sorted(camera_data_path.glob("*.png"))
     matching, device = load_superglue_model(config)

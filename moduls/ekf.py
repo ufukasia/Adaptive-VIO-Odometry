@@ -3,17 +3,19 @@ from scipy.spatial.transform import Rotation
 import cv2
 
 class ExtendedKalmanFilter:
-    def __init__(self, initial_quaternion, camera_matrix, dist_coeffs, theta_threshold):
+    def __init__(self, initial_quaternion, camera_matrix, dist_coeffs, theta_threshold, 
+                 process_noise_scale=1e-10, measurement_noise_scale=1e-3):
         self.q = initial_quaternion
-        self.P = np.diag([0.001, 0.001, 0.001, 0.001])
-        self.Q = np.diag([1e-10, 1e-10, 1e-10, 1e-10])
-        self.R_camera = np.diag([0.09, 0.09])
-        self.R_imu = np.diag([0.001, 0.001, 0.001, 0.001, 0.001, 0.001])
-        self.theta_threshold = theta_threshold  # Initialize theta_threshold as an instance variable
+        self.P = np.diag([1e-10, 1e-10, 1e-10, 1e-10])
+        self.Q = np.diag([process_noise_scale] * 4)
+        self.R_camera = np.diag([measurement_noise_scale, measurement_noise_scale])
+        self.R_imu = np.diag([0.0001, 0.001, 0.001, 0.00001, 0.00001, 0.00001])
+        self.theta_threshold = theta_threshold
         self.camera_matrix = camera_matrix
         self.dist_coeffs = dist_coeffs
 
-    def update(self, gyroscope, accelerometer, image_points, world_points, dt, theta):
+    def update(self, gyroscope, accelerometer, image_points, world_points, dt, theta, 
+               camera_weight=0.5, imu_weight=0.5):
         q = self.q
         if np.all(accelerometer == 0) and np.all(gyroscope == 0):
             return self.q
@@ -21,18 +23,20 @@ class ExtendedKalmanFilter:
             accelerometer = accelerometer / np.linalg.norm(accelerometer)
         q_pred = self.predict(q, gyroscope, dt)
         
-        deadline = 0.5  # This could also be made configurable if needed
-        
-        if theta > deadline:  # Theta çok yüksekse sadece IMU kullan
+        deadline = 0.50
+
+        if theta > deadline:
             self.q = self.update_imu_only(q_pred, gyroscope, accelerometer)
         elif image_points is not None and world_points is not None and len(image_points) >= 4:
-            if theta <= self.theta_threshold:  # Düşük theta değeri için tam kamera güncellemesi
-                self.q = self.update_with_camera(q_pred, image_points, world_points, gyroscope, accelerometer)
-            else:  # Orta theta değerleri için ağırlıklı ortalama
+            if theta <= self.theta_threshold:
+                q_camera = self.update_with_camera(q_pred, image_points, world_points, gyroscope, accelerometer)
+                q_imu = self.update_imu_only(q_pred, gyroscope, accelerometer)
+                self.q = self.weighted_quaternion_average([q_camera, q_imu], [camera_weight, imu_weight])
+            else:
                 camera_reliability = max(0, (deadline - theta) / (deadline - self.theta_threshold))
                 q_camera = self.update_with_camera(q_pred, image_points, world_points, gyroscope, accelerometer)
                 q_imu = self.update_imu_only(q_pred, gyroscope, accelerometer)
-                self.q = self.weighted_quaternion_average([q_camera, q_imu], [camera_reliability, 1 - camera_reliability])
+                self.q = self.weighted_quaternion_average([q_camera, q_imu], [camera_reliability * camera_weight, (1 - camera_reliability) * imu_weight])
         else:
             self.q = self.update_imu_only(q_pred, gyroscope, accelerometer)
         return self.q
@@ -43,14 +47,12 @@ class ExtendedKalmanFilter:
         q_pred = q + q_dot * dt
         q_pred = q_pred / np.linalg.norm(q_pred)
         
-        # Kovaryans tahmini eklendi
         F = self.calculate_state_transition_matrix(q, gyroscope, dt)
         self.P = F @ self.P @ F.T + self.Q
         
         return q_pred
 
     def calculate_state_transition_matrix(self, q, gyroscope, dt):
-        # Durum geçiş matrisini hesapla
         F = np.eye(4) + dt * 0.5 * np.array([
             [0, -gyroscope[0], -gyroscope[1], -gyroscope[2]],
             [gyroscope[0], 0, gyroscope[2], -gyroscope[1]],

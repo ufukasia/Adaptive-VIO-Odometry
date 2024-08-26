@@ -4,12 +4,19 @@ import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
 
 class ExtendedKalmanFilter:
-    def __init__(self, beta, initial_quaternion):
-        self.beta = beta
+    def __init__(self, initial_quaternion):
+        
+        
         self.q = initial_quaternion
-        self.P = np.eye(4) * 0.001
-        self.Q = np.eye(4) * 1e-10  
-        self.R = np.eye(3) * 0.001
+
+        self.P = np.diag([1e-10, 1e-10, 1e-10, 1e-10])  # Increased initial uncertainty
+        self.Q = np.diag([1e-10, 1e-10, 1e-10, 1e-8])  # Increased process noise for roll (last component)
+        self.R = np.diag([0.001, 0.001, 0.001])  # Increased noise for roll (last component)
+
+
+
+
+
 
     def update(self, gyroscope, accelerometer, dt):
         q = self.q
@@ -83,15 +90,15 @@ def angle_difference(angle1, angle2):
     diff = angle1 - angle2
     return (diff + 180) % 360 - 180
 
-def process_imu_data(file_path, beta=0.1):
+def process_imu_data(file_path):
     # Calibration values
     calibration = {
-        'w_RS_S_x [rad s^-1]': -0.003342,
+        'w_RS_S_x [rad s^-1]': -0.00339,
         'w_RS_S_y [rad s^-1]': 0.020582,
-        'w_RS_S_z [rad s^-1]': 0.079360,
-        'a_RS_S_x [m s^-2]': 0.045,
-        'a_RS_S_y [m s^-2]': 0.124,
-        'a_RS_S_z [m s^-2]': 0.0628
+        'w_RS_S_z [rad s^-1]': 0.079360,#roll değeri 
+        'a_RS_S_x [m s^-2]': 0.049,
+        'a_RS_S_y [m s^-2]': 0.084,
+        'a_RS_S_z [m s^-2]': 0.0428
     }
 
     # Read CSV file
@@ -110,7 +117,7 @@ def process_imu_data(file_path, beta=0.1):
         data[key] = data[key] - calibration[key]
 
     # Create EKF
-    ekf = ExtendedKalmanFilter(beta=beta, initial_quaternion=initial_quaternion)
+    ekf = ExtendedKalmanFilter(initial_quaternion=initial_quaternion)
 
     # Calculate quaternions and Euler angles
     estimated_quaternions = []
@@ -209,7 +216,7 @@ def visualize_error(data, aligned_quaternions, aligned_euler_angles, true_quater
     plt.show()
 
 if __name__ == "__main__":
-    file_path = 'MH_04_difficult\mav0\imu0\imu_with_interpolated_groundtruth.csv'
+    file_path = 'MH_01_easy\mav0\imu0\imu_with_interpolated_groundtruth.csv'
 
     data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles, rmse_quaternions, rmse_euler_angles = process_imu_data(file_path)
 

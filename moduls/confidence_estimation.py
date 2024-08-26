@@ -13,11 +13,14 @@ def quartic_unit_step(x):
 def relu(x):
     return np.maximum(0, x)
 
-def exponential_sigmoid(x):
-    return np.exp(x) / (1 + np.exp(x))
-
 def double_exponential_sigmoid(x):
     return (np.exp(x) - np.exp(-x)) / (np.exp(x) + np.exp(-x))
+
+def triple_exponential_sigmoid(x):
+    return (np.exp(x) - np.exp(-x)) / (np.exp(x) + np.exp(-x) + np.exp(-2*x))
+
+def quadruple_exponential_sigmoid(x):
+    return (np.exp(x) - np.exp(-x)) / (np.exp(x) + np.exp(-x) + np.exp(-2*x) + np.exp(-3*x))
 
 def step(x):
     return np.where(x >= 0, 1, 0)

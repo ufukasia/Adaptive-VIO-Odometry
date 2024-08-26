@@ -2,41 +2,45 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
-def quadratic_unit_step(x):
-    return np.minimum(x**2, 1)
+def quartic_unit_step(x):
+    return np.minimum(x**4, 1)
 
 def cubic_unit_step(x):
     return np.minimum(x**3, 1)
 
-def quartic_unit_step(x):
-    return np.minimum(x**4, 1)
+def quadratic_unit_step(x):
+    return np.minimum(x**2, 1)
 
 def relu(x):
     return np.maximum(0, x)
 
-def exponential_sigmoid(x):
-    return np.exp(x) / (1 + np.exp(x))
-
 def double_exponential_sigmoid(x):
     return (np.exp(x) - np.exp(-x)) / (np.exp(x) + np.exp(-x))
+
+def triple_exponential_sigmoid(x):
+    return (np.exp(x) - np.exp(-x)) / (np.exp(x) + np.exp(-x) + np.exp(-2*x))
+
+def quadruple_exponential_sigmoid(x):
+    return (np.exp(x) - np.exp(-x)) / (np.exp(x) + np.exp(-x) + np.exp(-2*x) + np.exp(-3*x))
 
 def step(x):
     return np.where(x >= 0, 1, 0)
 
 activation_functions = [
-    (quadratic_unit_step, "Quadratic Unit Step", (0, 1)),
-    (cubic_unit_step, "Cubic Unit Step", (0, 1)),
     (quartic_unit_step, "Quartic Unit Step", (0, 1)),
+    (cubic_unit_step, "Cubic Unit Step", (0, 1)),
+    (quadratic_unit_step, "Quadratic Unit Step", (0, 1)),
     (relu, "ReLU", (-1, 5)),
-    (exponential_sigmoid, "Exponential Sigmoid", (-5, 5)),
     (double_exponential_sigmoid, "Double Exponential Sigmoid", (-5, 5)),
+    (triple_exponential_sigmoid, "Triple Exponential Sigmoid", (-5, 5)),
+    (quadruple_exponential_sigmoid, "Quadruple Exponential Sigmoid", (-5, 5)),
     (step, "Step", (-1, 2))
 ]
 
 # Belirgin farklı renkler
-colors = ['#FF0000', '#00FF00', '#0000FF', '#FAAF00', '#FF00FF', '#00FFFF', '#800000']
+colors = ['#FF0000', '#00FF00', '#0000FF', '#FAAF00', '#FF00FF', '#00FFFF', '#800000', '#FFA500']
 
-fig = plt.figure(figsize=(20, 15), constrained_layout=True)
+fig = plt.figure(figsize=(20, 12), constrained_layout=True)
 gs = GridSpec(2, 4, figure=fig)
 
 for i, ((func, name, (x_min, x_max)), color) in enumerate(zip(activation_functions, colors)):
@@ -64,6 +68,6 @@ for i, ((func, name, (x_min, x_max)), color) in enumerate(zip(activation_functio
     ax.tick_params(axis='both', which='major', labelsize=8)
     ax.grid(True, linestyle=':', alpha=0.6)
 
-plt.suptitle('Selected Activation Functions', fontsize=24, fontweight='bold')
-plt.savefig('selected_activation_functions.png', dpi=300, bbox_inches='tight')
+plt.suptitle('Reordered Activation Functions', fontsize=24, fontweight='bold')
+plt.savefig('reordered_activation_functions_4x2.png', dpi=300, bbox_inches='tight')
 plt.show()

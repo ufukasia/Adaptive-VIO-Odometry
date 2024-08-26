@@ -183,12 +183,12 @@ def plot_results(all_scaled_data):
 
     for i, (dataset, scaled_data) in enumerate(all_scaled_data.items()):
         ax = fig.add_subplot(gs[i, 0])
-        ax.plot(scaled_data['delta_intensities'], label='Δ Intensity' if i == 0 else "", color=COLORS[0], linewidth=1.2)
-        ax.plot(scaled_data['entropies'], label='Entropy' if i == 0 else "", color=COLORS[1], linewidth=1.2)
-        ax.plot(scaled_data['motion_blurs'], label='Motion Blur' if i == 0 else "", color=COLORS[2], linewidth=1.2)
+        ax.plot(scaled_data['delta_intensities'], label='Δ Intensity' if i == 0 else "", color=COLORS[0], linewidth=1)
+        ax.plot(scaled_data['entropies'], label='Entropy' if i == 0 else "", color=COLORS[1], linewidth=1)
+        ax.plot(scaled_data['motion_blurs'], label='Motion Blur' if i == 0 else "", color=COLORS[2], linewidth=1)
         
         # Dataset adını sol üst köşeye yerleştir
-        ax.text(0.02, 0.98, dataset, transform=ax.transAxes, fontsize=10, fontweight='bold', 
+        ax.text(0.02, 0.98, dataset, transform=ax.transAxes, fontsize=8, fontweight='bold', 
                 verticalalignment='top', horizontalalignment='left',
                 bbox=dict(facecolor='white', edgecolor='none', alpha=0.7))
 
@@ -213,7 +213,7 @@ def plot_results(all_scaled_data):
         if i == 0:
             ax.legend(fontsize=10, frameon=True, fancybox=True, framealpha=0.7, loc='upper right')
 
-    plt.suptitle('Scaled Information Metrics', fontsize=18, fontweight='bold')
+    plt.suptitle('Scaled Information Metrics', fontsize=15, fontweight='bold')
     plt.tight_layout()
     plt.show()
 
