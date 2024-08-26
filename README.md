@@ -122,7 +122,7 @@ The script will generate the following outputs:
 When you set the value of "theta_threshold" above "1", kinformation-based confidence is disabled.
 ![Test of our Algorithm](error_score_plots.png)
 
-
+Extensive testing of our developed algorithm across various hyperparameters of the Extended Kalman Filter (EKF) is ongoing. While the algorithm has not yet achieved optimal hyperparameters across all datasets at this stage, consistent improvement in results has been observed in each trial. These findings demonstrate the positive impact of our proposed method in the field of visual-inertial odometry (VIO). Furthermore, these results support the potential applicability of high-speed unmanned aerial vehicles (UAVs) in real-time dynamic scenarios.
 
 
 
