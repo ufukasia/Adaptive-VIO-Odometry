@@ -1,4 +1,4 @@
-# Adaptive Visual-Inertial Odometry Using SuperGlue and Dynamic EKF
+# Adaptive Visual-Inertial Odometry Using SuperGlue and Dynamic EKF with Information-Based Confidence Estimation
 
 ATTENTION: COPYRIGHT NOTICE
 
