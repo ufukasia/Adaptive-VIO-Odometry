@@ -114,6 +114,17 @@ The script will generate the following outputs:
 - Visualization plots for quaternions, Euler angles, and errors
 - SuperGlue visualizations (if enabled)
 
+# Test
+
+When you set the value of "theta_threshold" above "1", kinformation-based confidence is disabled.
+
+
+
+
+
+
+
+
 ## Contributing
 
 Contributions to improve the system or add new features are welcome. Please feel free to submit pull requests or open issues for any bugs or suggestions.
