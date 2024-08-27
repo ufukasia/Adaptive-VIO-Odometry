@@ -17,7 +17,7 @@ from moduls.visualization import visualize_results, visualize_error, visualize_s
 from moduls.confidence_estimation import quadratic_unit_step, cubic_unit_step, quartic_unit_step, relu, double_exponential_sigmoid, triple_exponential_sigmoid, quadruple_exponential_sigmoid, step
 
 DEFAULT_DATASET = "EurocMav"
-DEFAULT_SEQUENCE = "MH_02_easy"
+DEFAULT_SEQUENCE = "MH_05_difficult"
 BASE_URL = "http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/machine_hall/"
 
 def download_dataset(sequence_name, dataset_path):
