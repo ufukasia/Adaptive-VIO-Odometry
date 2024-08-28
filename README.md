@@ -135,6 +135,17 @@ The script will generate the following outputs:
 - SuperGlue visualizations (if enabled)
 
 # Test of our Algorithm
+##Adaptive tests
+python main.py --sequence MH_03_medium
+python main.py --sequence MH_04_difficult
+python main.py --sequence MH_05_difficult
+##Nonadaptive tests
+python main.py --sequence MH_03_medium --theta_threshold 1.1
+python main.py --sequence MH_04_difficult --theta_threshold 1.1
+python main.py --sequence MH_05_difficult --theta_threshold 1.1
+
+
+
 
 ***When you set the value of "theta_threshold" above "1", information-based confidence is disabled.***
 ![Test of our Algorithm](error_score_plots.png)
