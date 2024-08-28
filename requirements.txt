@@ -1,7 +1,6 @@
 numpy
 matplotlib
 opencv-python
-torch
 pandas
 tqdm
 scipy
