@@ -147,6 +147,9 @@ python main.py --sequence MH_04_difficult
 python main.py --sequence MH_05_difficult
 ```
 ***Non-adaptive tests***
+
+Given that all utilized activation functions produce a maximum value of 1, setting theta to 1.1 would result in the non-application of the information-based approach. This is because the threshold would consistently exceed the maximum possible output of the activation functions, thereby negating the intended adaptive behavior of the system
+
 ```
 python main.py --sequence MH_03_medium --theta_threshold 1.1
 python main.py --sequence MH_04_difficult --theta_threshold 1.1
