@@ -94,7 +94,10 @@ python main.py [OPTIONS]
 
 2. Use a specific dataset sequence and download it:
    ```
-   python main.py --sequence MH_01_easy --download
+   python main.py --sequence MH_03_medium
+   python main.py --sequence MH_04_difficult
+   python main.py --sequence MH_05_difficult
+
    ```
 
 3. Customize confidence estimation parameters:
