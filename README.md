@@ -137,15 +137,17 @@ The script will generate the following outputs:
 ## Test of our Algorithm
 
 # Adaptive tests
+```
 python main.py --sequence MH_03_medium
 python main.py --sequence MH_04_difficult
 python main.py --sequence MH_05_difficult
-
+```
 # Nonadaptive tests
+```
 python main.py --sequence MH_03_medium --theta_threshold 1.1
 python main.py --sequence MH_04_difficult --theta_threshold 1.1
 python main.py --sequence MH_05_difficult --theta_threshold 1.1
-
+```
 
 
 
