@@ -55,7 +55,7 @@ For GPU (CUDA) support:
    pip3 install torch torchvision torchaudio
    ```
    
-4. Install the required dependencies:
+3. Install the required dependencies:
    ```
    pip install -r requirements.txt
    ```
