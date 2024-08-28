@@ -111,6 +111,10 @@ python main.py [OPTIONS]
    ```
    python main.py --activation_function relu --generate_superglue_visualizations
    ```
+   ![Functions](Used_activation_functions_4x2.png)
+
+
+
 
    5.Superglue visualizations
       ```
