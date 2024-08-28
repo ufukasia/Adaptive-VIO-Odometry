@@ -40,7 +40,7 @@ This project implements an Adaptive Visual-Inertial Odometry (VIO) system using 
 
 2. Install PyTorch:
 
-It runs 20x faster with GPU. Highly recommended.
+Highly recommended. It runs 20x faster with GPU.
    
 For GPU (CUDA) support:
    ```
@@ -74,12 +74,14 @@ python main.py [OPTIONS]
 ```
 
 ### Options:
+***These parameters are set for best scores. It is likely that changing these values ​​will lower the result!***
+
 
 - `--dataset_path`: Path to save the dataset (default: current directory)
-- `--sequence`: Dataset sequence to use (default: MH_04_difficult)
+- `--sequence`: Dataset sequence to use (default: MH_05_difficult)
 - `--download`: Force download the dataset even if it exists
-- `--alpha`: Alpha parameter for confidence estimation (default: 1)
-- `--beta`: Beta parameter for confidence estimation (default: 1)
+- `--alpha`: Alpha parameter for confidence estimation (default: 1.05)
+- `--beta`: Beta parameter for confidence estimation (default: 1.05)
 - `--gamma`: Gamma parameter for confidence estimation (default: 1)
 - `--theta_threshold`: Theta threshold for adaptive fusion (default: 0.3)
 - `--activation_function`: Activation function to use for confidence estimation (default: double_exponential_sigmoid)
@@ -102,15 +104,21 @@ python main.py [OPTIONS]
 
 3. Customize confidence estimation parameters:
    ```
-   python main.py --alpha 2.5 --beta 1.2 --gamma 0.8 --theta_threshold 0.25
+   python main.py --alpha 0.8 --beta 1.1 --gamma 2 --theta_threshold 0.25
    ```
 
-4. Use a different activation function and generate SuperGlue visualizations:
+4. Use a different activation function
    ```
    python main.py --activation_function relu --generate_superglue_visualizations
    ```
 
-5. Process a locally stored dataset:
+5.Superglue visualizations
+   ```
+   python main.py --generate_superglue_visualizations
+   ```
+   
+
+6. Process a locally stored dataset:
    ```
    python main.py --dataset_path /path/to/your/dataset --sequence custom_sequence
    ```
