@@ -112,11 +112,13 @@ python main.py [OPTIONS]
    python main.py --activation_function relu --generate_superglue_visualizations
    ```
 
-5.Superglue visualizations
-   ```
-   python main.py --generate_superglue_visualizations
-   ```
-   
+   5.Superglue visualizations
+      ```
+      python main.py --generate_superglue_visualizations
+      ```
+
+   ![Visualizations](super-out_MH_05_difficult/superglue_match_0090.png)
+
 
 6. Process a locally stored dataset:
    ```
