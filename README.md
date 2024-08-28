@@ -39,19 +39,23 @@ This project implements an Adaptive Visual-Inertial Odometry (VIO) system using 
 
 
 2. Install PyTorch:
+
+It runs 20x faster with GPU. Highly recommended.
    
-   For CPU-only:
-   ```
-   pip3 install torch torchvision torchaudio
-   ```
-   
-   For GPU (CUDA) support:
+For GPU (CUDA) support:
    ```
    pip3 install torch torchvision torchaudio --index-url --index-url https://download.pytorch.org/whl/cu118
    ```
    Note: Replace `cu118` with your CUDA version if different.   Please visit https://pytorch.org/get-started/locally/ for different installations
 
-3. Install the required dependencies:
+ 
+
+   For CPU-only:
+   ```
+   pip3 install torch torchvision torchaudio
+   ```
+   
+4. Install the required dependencies:
    ```
    pip install -r requirements.txt
    ```
