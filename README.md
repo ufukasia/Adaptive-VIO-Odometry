@@ -140,7 +140,7 @@ MIT Licence
 If you use this code in your research, please cite our paper:
 
 ```
-[Your paper citation here]
+[Ufuk ASIL](https://scholar.google.com/citations?user=TWYpF_MAAAAJ&hl=tr)
 ```
 
 ## Acknowledgements
