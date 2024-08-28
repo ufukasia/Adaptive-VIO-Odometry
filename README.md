@@ -134,15 +134,15 @@ The script will generate the following outputs:
 - Visualization plots for quaternions, Euler angles, and errors
 - SuperGlue visualizations (if enabled)
 
-## Test of our Algorithm
+# Test of our Algorithm
 
-# Adaptive tests
+***Adaptive tests***
 ```
 python main.py --sequence MH_03_medium
 python main.py --sequence MH_04_difficult
 python main.py --sequence MH_05_difficult
 ```
-# Nonadaptive tests
+***Non-adaptive tests***
 ```
 python main.py --sequence MH_03_medium --theta_threshold 1.1
 python main.py --sequence MH_04_difficult --theta_threshold 1.1
