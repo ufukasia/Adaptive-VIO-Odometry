@@ -40,7 +40,7 @@ This project implements an Adaptive Visual-Inertial Odometry (VIO) system using 
 
 2. Install PyTorch:
 
-Highly recommended. It runs 20x faster with GPU.
+**Highly recommended**. <span style="color:red">It runs 20x faster with GPU.</span>
    
 For GPU (CUDA) support:
    ```
@@ -116,7 +116,7 @@ python main.py [OPTIONS]
 
 
 
-   5.Superglue visualizations
+5.Superglue visualizations
       ```
       python main.py --generate_superglue_visualizations
       ```
