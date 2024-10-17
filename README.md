@@ -179,7 +179,7 @@ MIT Licence
 If you use this code in your research, please cite our paper:
 
 ```
-[Ufuk ASIL](https://scholar.google.com/citations?user=TWYpF_MAAAAJ&hl=tr)
+Ufuk ASIL, Efendi Nasibov. Adaptive Visual-Inertial Odometry Using SuperGlue and Dynamic EKF with Information-Based Confidence Estimation, 20 September 2024, PREPRINT (Version 1) available at Research Square [https://doi.org/10.21203/rs.3.rs-4935014/v1]
 ```
 
 ## Acknowledgements
