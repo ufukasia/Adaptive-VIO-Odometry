@@ -6,3 +6,4 @@ tqdm
 scipy
 Pillow
 requests
+pyyaml
