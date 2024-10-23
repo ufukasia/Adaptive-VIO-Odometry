@@ -1,0 +1,1045 @@
+# camera.py içeriği:
+
+import yaml
+import cv2
+import torch
+import numpy as np
+from models.matching import Matching
+from models.utils import frame2tensor
+
+def load_camera_params(yaml_file):
+    with open(yaml_file, 'r') as file:
+        params = yaml.safe_load(file)
+    
+    intrinsics = params['intrinsics']
+    camera_matrix = np.array([
+        [intrinsics[0], 0, intrinsics[2]],
+        [0, intrinsics[1], intrinsics[3]],
+        [0, 0, 1]
+    ])
+    dist_coeffs = np.array(params['distortion_coefficients'])
+    
+    return camera_matrix, dist_coeffs
+
+def load_superglue_model(config):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    superglue_config = {
+        'superpoint': {
+            'nms_radius': config['superglue']['nms_radius'],
+            'keypoint_threshold': config['superglue']['keypoint_threshold'],
+            'max_keypoints': config['superglue']['max_keypoints']
+        },
+        'superglue': {
+            'weights': config['superglue']['weights'],
+            'sinkhorn_iterations': config['superglue']['sinkhorn_iterations'],
+            'match_threshold': config['superglue']['match_threshold'],
+        }
+    }
+    
+    try:
+        matching = Matching(superglue_config).eval().to(device)
+        print("SuperGlue model loaded successfully")
+        
+        # Test the model with dummy input
+        dummy_input = torch.randn(1, 1, 480, 752).to(device)
+        try:
+            with torch.no_grad():
+                _ = matching({'image0': dummy_input, 'image1': dummy_input})
+            print("SuperGlue model test passed")
+        except Exception as e:
+            print(f"Error during SuperGlue model test: {e}")
+        
+        return matching, device
+    except Exception as e:
+        print(f"Error loading SuperGlue model: {e}")
+        print(f"SuperGlue config: {superglue_config}")
+        raise
+
+def report_outlier_method(method, threshold):
+    if method == 'ransac':
+        print(f"Using RANSAC with threshold: {threshold}")
+    elif method == 'distance':
+        print(f"Using distance-based filtering with threshold: {threshold}")
+    elif method == 'confidence':
+        print(f"Using confidence-based filtering with threshold: {threshold}")
+
+def match_features_superglue(img1, img2, matching, device, outlier_method='ransac', ransac_threshold=3.0, distance_threshold=10.0, confidence_threshold=0.5):
+    # Convert images to tensors
+    frame_tensor1 = frame2tensor(img1, device)
+    frame_tensor2 = frame2tensor(img2, device)
+    
+    # Perform the matching
+    with torch.no_grad():
+        pred = matching({'image0': frame_tensor1, 'image1': frame_tensor2})
+    
+    # Detach tensors and convert to numpy arrays
+    pred = {k: v[0].detach().cpu().numpy() for k, v in pred.items()}
+    kpts0, kpts1 = pred['keypoints0'], pred['keypoints1']
+    matches, conf = pred['matches0'], pred['matching_scores0']
+    
+    # Keep the matching points
+    valid = matches > -1
+    mkpts0 = kpts0[valid]
+    mkpts1 = kpts1[matches[valid]]
+    mconf = conf[valid]
+    
+    initial_matches = len(mkpts0)
+    
+    if outlier_method == 'ransac':
+        if len(mkpts0) >= 8 and len(mkpts1) >= 8:
+            _, mask = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, ransac_threshold)
+            if mask is not None:
+                mask = mask.ravel() != 0
+                mkpts0 = mkpts0[mask]
+                mkpts1 = mkpts1[mask]
+                mconf = mconf[mask]
+    elif outlier_method == 'distance':
+        distances = np.linalg.norm(mkpts0 - mkpts1, axis=1)
+        mask = distances < distance_threshold
+        mkpts0 = mkpts0[mask]
+        mkpts1 = mkpts1[mask]
+        mconf = mconf[mask]
+    elif outlier_method == 'confidence':
+        mask = mconf > confidence_threshold
+        mkpts0 = mkpts0[mask]
+        mkpts1 = mkpts1[mask]
+        mconf = mconf[mask]
+    
+    filtered_matches = len(mkpts0)
+    
+    return mkpts0, mkpts1, initial_matches, filtered_matches
+
+def detect_features(image_path, prev_image_path, matching, device, outlier_method='ransac', ransac_threshold=0.5, distance_threshold=5.0, confidence_threshold=0.9, verbose=False):
+    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    
+    if prev_image_path is not None:
+        prev_image = cv2.imread(prev_image_path, cv2.IMREAD_GRAYSCALE)
+        src_pts, dst_pts, initial_matches, filtered_matches = match_features_superglue(prev_image, image, matching, device, 
+                                                    outlier_method, ransac_threshold, 
+                                                    distance_threshold, confidence_threshold)
+        return src_pts, dst_pts, initial_matches, filtered_matches
+    else:
+        return None, None, 0, 0
+
+if __name__ == "__main__":
+    print("This module is not meant to be run directly. Please use main-vio-file.py instead.")
+
+########################################
+
+# confidence_estimation.py içeriği:
+
+import numpy as np
+import cv2
+
+def quadratic_unit_step(x):
+    return np.minimum(x**2, 1)
+
+def cubic_unit_step(x):
+    return np.minimum(x**3, 1)
+
+def quartic_unit_step(x):
+    return np.minimum(x**4, 1)
+
+def relu(x):
+    return np.maximum(0, x)
+
+def double_exponential_sigmoid(x):
+    return (np.exp(x) - np.exp(-x)) / (np.exp(x) + np.exp(-x))
+
+def triple_exponential_sigmoid(x):
+    return (np.exp(x) - np.exp(-x)) / (np.exp(x) + np.exp(-x) + np.exp(-2*x))
+
+def quadruple_exponential_sigmoid(x):
+    return (np.exp(x) - np.exp(-x)) / (np.exp(x) + np.exp(-x) + np.exp(-2*x) + np.exp(-3*x))
+
+def step(x):
+    return np.where(x >= 0, 1, 0)
+
+class AdaptivePositiveNormalizer:
+    def __init__(self, initial_value=0, alpha=0.01):
+        self.mean = max(initial_value, 0)
+        self.max_value = max(initial_value, 1e-6)  # Avoid division by zero
+        self.alpha = alpha  # Learning rate for the running statistics
+
+    def update(self, value):
+        value = max(value, 0)  # Ensure non-negative value
+        self.mean = (1 - self.alpha) * self.mean + self.alpha * value
+        self.max_value = max(self.max_value, value)
+
+    def normalize(self, value):
+        value = max(value, 0)  # Ensure non-negative value
+        if self.max_value == 0:
+            return 0
+        return value / self.max_value
+
+def normalize_delta_intensity(delta):
+    """
+    Delta intensity değerlerini 0-256 aralığında normalize eder.
+    """
+    return min(delta, 256) / 256
+
+def estimate_confidence(image, prev_intensity, config):
+    intensity = calculate_intensity(image)
+    entropy = calculate_entropy(image)
+    motion_blur = calculate_motion_blur(image)
+    
+    intensity_normalizer = AdaptivePositiveNormalizer()
+    motion_blur_normalizer = AdaptivePositiveNormalizer()
+    
+    intensity_normalizer.update(intensity)
+    motion_blur_normalizer.update(motion_blur)
+    
+    normalized_intensity = intensity_normalizer.normalize(intensity)
+    normalized_entropy = entropy / 8  # Entropi değerini 8'e bölerek normalize ediyoruz
+    normalized_motion_blur = motion_blur_normalizer.normalize(motion_blur)
+    
+    scaled_entropy = (1 - normalized_entropy) * config['beta']
+    scaled_motion_blur = normalized_motion_blur * config['gamma'] * 0.2
+    
+    if prev_intensity is not None:
+        delta_intensity = abs(intensity - prev_intensity)
+        normalized_delta_intensity = normalize_delta_intensity(delta_intensity * 255)
+        scaled_delta_intensity = normalized_delta_intensity * config['alpha'] * 10
+        
+        combined_value = max(scaled_delta_intensity, scaled_entropy, scaled_motion_blur)
+        
+        if combined_value > config['theta_threshold']:
+            theta = config['activation_func'](combined_value - config['theta_threshold'])
+        else:
+            theta = 0
+    else:
+        theta = 0
+    
+    return intensity, entropy, theta
+
+def calculate_intensity(image):
+    return np.mean(image) / 255.0
+
+def calculate_entropy(image):
+    histogram = cv2.calcHist([image], [0], None, [256], [0, 256])
+    histogram = histogram.flatten() / np.sum(histogram)
+    non_zero = histogram[histogram > 0]
+    return -np.sum(non_zero * np.log2(non_zero))
+
+def calculate_motion_blur(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+########################################
+
+# data_processing.py içeriği:
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import os
+import cv2
+import torch
+from pathlib import Path
+from .ekf import ExtendedKalmanFilter, quaternion_to_euler, ensure_quaternion_continuity, align_quaternions, ensure_angle_continuity
+from .camera import load_camera_params, load_superglue_model, match_features_superglue, detect_features
+from .confidence_estimation import estimate_confidence
+from models.utils import frame2tensor
+
+def process_imu_data(imu_file_path, camera_file_path, camera_data_path, camera_yaml_path, config, sequence_name, verbose=False):
+    try:
+        camera_matrix, dist_coeffs = load_camera_params(camera_yaml_path)
+
+        calibration = {
+            'w_RS_S_x [rad s^-1]': -0.003342,
+            'w_RS_S_y [rad s^-1]': 0.020582,
+            'w_RS_S_z [rad s^-1]': 0.079360,
+            'a_RS_S_x [m s^-2]': 0.045,
+            'a_RS_S_y [m s^-2]': 0.124,
+            'a_RS_S_z [m s^-2]': 0.0628
+        }
+
+        imu_data = pd.read_csv(imu_file_path)
+        camera_data = pd.read_csv(camera_file_path)
+
+        initial_quaternion = imu_data[[' q_RS_w []', ' q_RS_x []', ' q_RS_y []', ' q_RS_z []']].iloc[0].values
+
+        imu_data['timestamp'] = pd.to_datetime(imu_data['#timestamp [ns]'], unit='ns')
+        imu_data['dt'] = imu_data['timestamp'].diff().dt.total_seconds()
+        imu_data.loc[0, 'dt'] = 0
+
+        for key in calibration:
+            imu_data[key] = imu_data[key] - calibration[key]
+
+        ekf = ExtendedKalmanFilter(initial_quaternion=initial_quaternion, 
+                                   camera_matrix=camera_matrix, 
+                                   dist_coeffs=dist_coeffs,
+                                   theta_threshold=config['theta_threshold'])
+
+        estimated_quaternions = []
+        estimated_euler_angles = []
+        thetas = []
+        timestamps = []
+        q_prev = initial_quaternion
+
+        prev_image_path = None
+        prev_intensity = None
+
+        try:
+            matching, device = load_superglue_model(config)
+            if verbose:
+                print("SuperGlue model loaded successfully")
+        except Exception as e:
+            if verbose:
+                print(f"Error loading SuperGlue model: {e}")
+            matching, device = None, None
+
+        progress_bar = tqdm(total=len(imu_data), desc="Processing IMU data")
+
+        match_data = []  # New list to store match data
+
+        for _, row in imu_data.iterrows():
+            gyro = np.array([row['w_RS_S_x [rad s^-1]'], row['w_RS_S_y [rad s^-1]'], row['w_RS_S_z [rad s^-1]']])
+            accel = np.array([row['a_RS_S_x [m s^-2]'], row['a_RS_S_y [m s^-2]'], row['a_RS_S_z [m s^-2]']])
+            
+            camera_row = camera_data[camera_data['#timestamp [ns]'] == row['#timestamp [ns]']]
+            
+            if not camera_row.empty:
+                image_path = os.path.join(camera_data_path, camera_row['filename'].values[0])
+                image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+                intensity, entropy, theta = estimate_confidence(image, prev_intensity, config)
+                thetas.append(theta)
+                
+                if matching is not None and device is not None:
+                    try:
+                        src_pts, dst_pts, initial_matches, filtered_matches = detect_features(
+                            image_path=image_path,
+                            prev_image_path=prev_image_path,
+                            matching=matching,
+                            device=device,
+                            outlier_method='distance',
+                            ransac_threshold=0.5,
+                            distance_threshold=5.0,
+                            confidence_threshold=0.9,
+                            verbose=verbose
+                        )
+                        match_data.append({
+                            'timestamp': row['#timestamp [ns]'],
+                            'initial_matches': initial_matches,
+                            'filtered_matches': filtered_matches
+                        })
+                    except Exception as e:
+                        if verbose:
+                            print(f"Error detecting features: {e}")
+                        src_pts, dst_pts = None, None
+                else:
+                    src_pts, dst_pts = None, None
+                
+                prev_image_path = image_path
+                prev_intensity = intensity
+                
+                if src_pts is not None and dst_pts is not None:
+                    world_points = np.hstack((src_pts.reshape(-1, 2), np.zeros((src_pts.shape[0], 1))))
+                    image_points = dst_pts.reshape(-1, 2)
+                else:
+                    world_points, image_points = None, None
+            else:
+                world_points, image_points = None, None
+                theta = thetas[-1] if thetas else 0
+                thetas.append(theta)
+            
+            q = ekf.update(gyro, accel, image_points, world_points, row['dt'], theta)
+            q = ensure_quaternion_continuity(q, q_prev)
+            estimated_quaternions.append(q)
+            estimated_euler_angles.append(quaternion_to_euler(q))
+            timestamps.append(row['#timestamp [ns]'])
+            q_prev = q
+
+            progress_bar.update(1)
+
+        progress_bar.close()
+
+        # Save match data to CSV with sequence name
+        match_df = pd.DataFrame(match_data)
+        match_output_file = f'{sequence_name}_match_data.csv'
+        match_df.to_csv(match_output_file, index=False)
+        if verbose:
+            print(f"Match data saved to {match_output_file}")
+
+        estimated_quaternions = np.array(estimated_quaternions)
+        estimated_euler_angles = np.array(estimated_euler_angles)
+        thetas = np.array(thetas)
+
+        true_quaternions = imu_data[[' q_RS_w []', ' q_RS_x []', ' q_RS_y []', ' q_RS_z []']].values
+        true_euler_angles = np.array([quaternion_to_euler(q) for q in true_quaternions])
+
+        aligned_quaternions = align_quaternions(estimated_quaternions, true_quaternions)
+        aligned_euler_angles = np.array([quaternion_to_euler(q) for q in aligned_quaternions])
+
+        aligned_euler_angles = ensure_angle_continuity(aligned_euler_angles)
+        true_euler_angles = ensure_angle_continuity(true_euler_angles[:len(aligned_euler_angles)])
+
+        rmse_quaternions = np.sqrt(((aligned_quaternions - true_quaternions[:len(aligned_quaternions)]) ** 2).mean(axis=0))
+        rmse_euler_angles = calculate_angle_rmse(aligned_euler_angles, true_euler_angles)
+
+        return imu_data, aligned_quaternions, aligned_euler_angles, true_quaternions[:len(aligned_quaternions)], true_euler_angles, rmse_quaternions, rmse_euler_angles, thetas, timestamps
+
+    except Exception as e:
+        if verbose:
+            print(f"An error occurred in process_imu_data: {e}")
+        raise
+
+def calculate_angle_rmse(predictions, targets):
+    diff = np.array([angle_difference(p, t) for p, t in zip(predictions, targets)])
+    return np.sqrt((diff ** 2).mean(axis=0))
+
+def angle_difference(angle1, angle2):
+    diff = angle1 - angle2
+    return (diff + 180) % 360 - 180
+
+def preprocess_imu_data(base_path):
+    try:
+        imu_df = pd.read_csv(base_path / 'imu0/data.csv')
+        groundtruth_df = pd.read_csv(base_path / 'state_groundtruth_estimate0/data.csv')
+        
+        groundtruth_df.set_index('#timestamp', inplace=True)
+        groundtruth_df.sort_index(inplace=True)
+        
+        velocity_cols = [' v_RS_R_x [m s^-1]', ' v_RS_R_y [m s^-1]', ' v_RS_R_z [m s^-1]']
+        quaternion_cols = [' q_RS_w []', ' q_RS_x []', ' q_RS_y []', ' q_RS_z []']
+        
+        for col in velocity_cols + quaternion_cols:
+            if col in groundtruth_df.columns:
+                imu_df[col] = np.interp(imu_df['#timestamp [ns]'], 
+                                        groundtruth_df.index.values, 
+                                        groundtruth_df[col].values)
+        
+        output_file = base_path / 'imu0/imu_with_interpolated_groundtruth.csv'
+        imu_df.to_csv(output_file, index=False)
+        print(f"Preprocessed IMU data saved to {output_file}")
+    except Exception as e:
+        print(f"An error occurred during preprocessing: {e}")
+        raise
+
+if __name__ == "__main__":
+    print("This module is not meant to be run directly. Please use main.py instead.")
+
+########################################
+
+# ekf.py içeriği:
+
+import numpy as np
+from scipy.spatial.transform import Rotation
+import cv2
+
+class ExtendedKalmanFilter:
+    def __init__(self, initial_quaternion, camera_matrix, dist_coeffs, theta_threshold, 
+                 process_noise_scale=1e-10, measurement_noise_scale=1e-3):
+        self.q = initial_quaternion
+        self.P = np.diag([1e-10, 1e-10, 1e-10, 1e-10])
+        self.Q = np.diag([process_noise_scale] * 4)
+        self.R_camera = np.diag([measurement_noise_scale, measurement_noise_scale])
+        self.R_imu = np.diag([0.0001, 0.001, 0.001, 0.00001, 0.00001, 0.00001])
+        self.theta_threshold = theta_threshold
+        self.camera_matrix = camera_matrix
+        self.dist_coeffs = dist_coeffs
+
+    def update(self, gyroscope, accelerometer, image_points, world_points, dt, theta, 
+               camera_weight=0.5, imu_weight=0.5):
+        q = self.q
+        if np.all(accelerometer == 0) and np.all(gyroscope == 0):
+            return self.q
+        if np.linalg.norm(accelerometer) != 0:
+            accelerometer = accelerometer / np.linalg.norm(accelerometer)
+        q_pred = self.predict(q, gyroscope, dt)
+        
+        deadline = 0.50
+
+        if theta > deadline:
+            self.q = self.update_imu_only(q_pred, gyroscope, accelerometer)
+        elif image_points is not None and world_points is not None and len(image_points) >= 4:
+            if theta <= self.theta_threshold:
+                q_camera = self.update_with_camera(q_pred, image_points, world_points, gyroscope, accelerometer)
+                q_imu = self.update_imu_only(q_pred, gyroscope, accelerometer)
+                self.q = self.weighted_quaternion_average([q_camera, q_imu], [camera_weight, imu_weight])
+            else:
+                camera_reliability = max(0, (deadline - theta) / (deadline - self.theta_threshold))
+                q_camera = self.update_with_camera(q_pred, image_points, world_points, gyroscope, accelerometer)
+                q_imu = self.update_imu_only(q_pred, gyroscope, accelerometer)
+                self.q = self.weighted_quaternion_average([q_camera, q_imu], [camera_reliability * camera_weight, (1 - camera_reliability) * imu_weight])
+        else:
+            self.q = self.update_imu_only(q_pred, gyroscope, accelerometer)
+        return self.q
+
+    def predict(self, q, gyroscope, dt):
+        omega = np.array([0, *gyroscope])
+        q_dot = 0.5 * self.quaternion_multiply(q, omega)
+        q_pred = q + q_dot * dt
+        q_pred = q_pred / np.linalg.norm(q_pred)
+        
+        F = self.calculate_state_transition_matrix(q, gyroscope, dt)
+        self.P = F @ self.P @ F.T + self.Q
+        
+        return q_pred
+
+    def calculate_state_transition_matrix(self, q, gyroscope, dt):
+        F = np.eye(4) + dt * 0.5 * np.array([
+            [0, -gyroscope[0], -gyroscope[1], -gyroscope[2]],
+            [gyroscope[0], 0, gyroscope[2], -gyroscope[1]],
+            [gyroscope[1], -gyroscope[2], 0, gyroscope[0]],
+            [gyroscope[2], gyroscope[1], -gyroscope[0], 0]
+        ])
+        return F
+
+    def update_imu_only(self, q_pred, gyroscope, accelerometer):
+        F_imu = np.array([
+            2*(q_pred[1]*q_pred[3] - q_pred[0]*q_pred[2]) - accelerometer[0],
+            2*(q_pred[0]*q_pred[1] + q_pred[2]*q_pred[3]) - accelerometer[1],
+            2*(0.5 - q_pred[1]**2 - q_pred[2]**2) - accelerometer[2],
+            *gyroscope
+        ])
+        J_imu = np.array([
+            [-2*q_pred[2], 2*q_pred[3], -2*q_pred[0], 2*q_pred[1]],
+            [2*q_pred[1], 2*q_pred[0], 2*q_pred[3], 2*q_pred[2]],
+            [0, -4*q_pred[1], -4*q_pred[2], 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0]
+        ])
+
+        H = J_imu
+        y = -F_imu
+        R = self.R_imu
+
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        
+        x_update = K @ y
+        q_update = x_update[:4]
+
+        q = q_pred + q_update
+        q = q / np.linalg.norm(q)
+
+        self.P = (np.eye(4) - K @ H) @ self.P
+
+        return q
+
+    def update_with_camera(self, q_pred, image_points, world_points, gyroscope, accelerometer):
+        success, rvec, tvec = self.pnp_solve(world_points, image_points, q_pred)
+        
+        if not success:
+            return self.update_imu_only(q_pred, gyroscope, accelerometer)
+        
+        r_mat, _ = cv2.Rodrigues(rvec)
+        q_camera = Rotation.from_matrix(r_mat).as_quat()
+        
+        y_camera = q_camera - q_pred
+        
+        H_camera = np.eye(4)
+        
+        F_imu = np.array([
+            2*(q_pred[1]*q_pred[3] - q_pred[0]*q_pred[2]) - accelerometer[0],
+            2*(q_pred[0]*q_pred[1] + q_pred[2]*q_pred[3]) - accelerometer[1],
+            2*(0.5 - q_pred[1]**2 - q_pred[2]**2) - accelerometer[2],
+            *gyroscope
+        ])
+        J_imu = np.array([
+            [-2*q_pred[2], 2*q_pred[3], -2*q_pred[0], 2*q_pred[1]],
+            [2*q_pred[1], 2*q_pred[0], 2*q_pred[3], 2*q_pred[2]],
+            [0, -4*q_pred[1], -4*q_pred[2], 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0]
+        ])
+        
+        H = np.vstack((J_imu, H_camera))
+        y = np.concatenate((-F_imu, y_camera))
+        R = np.block([
+            [self.R_imu, np.zeros((6, 4))],
+            [np.zeros((4, 6)), np.eye(4) * self.R_camera[0, 0]]
+        ])
+
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        
+        x_update = K @ y
+        q_update = x_update[:4]
+
+        q = q_pred + q_update
+        q = q / np.linalg.norm(q)
+
+        self.P = (np.eye(4) - K @ H) @ self.P
+
+        return q
+
+    def quaternion_multiply(self, q1, q2):
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        y = w1 * y2 + y1 * w2 + z1 * x2 - x1 * z2
+        z = w1 * z2 + z1 * w2 + x1 * y2 - y1 * x2
+        return np.array([w, x, y, z])
+
+    def pnp_solve(self, world_points, image_points, q_pred):
+        if len(world_points) < 4:
+            return False, None, None
+        
+        rvec_init = Rotation.from_quat(q_pred).as_rotvec()
+        tvec_init = np.zeros(3)
+        
+        try:
+            success, rvec, tvec = cv2.solvePnP(world_points, image_points, self.camera_matrix, self.dist_coeffs,
+                                               rvec=rvec_init, tvec=tvec_init, useExtrinsicGuess=True)
+        except cv2.error:
+            return False, None, None
+        
+        return success, rvec, tvec
+
+    def weighted_quaternion_average(self, quaternions, weights):
+        avg = np.zeros(4)
+        for q, w in zip(quaternions, weights):
+            avg += q * w
+        avg = avg / np.linalg.norm(avg)
+        return avg
+
+# Yardımcı fonksiyonlar
+def quaternion_to_euler(q):
+    r = Rotation.from_quat(q)
+    return r.as_euler('xyz', degrees=True)
+
+def ensure_quaternion_continuity(q, q_prev):
+    if np.dot(q, q_prev) < 0:
+        return -q
+    return q
+
+def align_quaternions(estimated_quaternions, true_quaternions):
+    min_length = min(len(estimated_quaternions), len(true_quaternions))
+    aligned_quaternions = np.copy(estimated_quaternions[:min_length])
+    for i in range(min_length):
+        if np.dot(estimated_quaternions[i], true_quaternions[i]) < 0:
+            aligned_quaternions[i] = -aligned_quaternions[i]
+    return aligned_quaternions
+
+def ensure_angle_continuity(angles, threshold=180):
+    return np.unwrap(angles, axis=0, period=2*threshold)
+
+def calculate_angle_rmse(predictions, targets):
+    diff = np.array([angle_difference(p, t) for p, t in zip(predictions, targets)])
+    return np.sqrt((diff ** 2).mean(axis=0))
+
+def angle_difference(angle1, angle2):
+    diff = angle1 - angle2
+    return (diff + 180) % 360 - 180
+
+########################################
+
+# visualization.py içeriği:
+
+import matplotlib.pyplot as plt
+import numpy as np
+import cv2
+import torch
+from pathlib import Path
+import matplotlib.cm as cm
+from models.matching import Matching
+from models.utils import frame2tensor
+
+# Try setting a different backend for matplotlib
+plt.switch_backend('TkAgg')
+
+def visualize_results(data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles, rmse_quaternions, rmse_euler_angles, thetas, sequence_name):
+    fig, axs = plt.subplots(4, 2, figsize=(15, 20))
+    fig.suptitle('Pose Estimation Errors', fontsize=16, fontweight='bold', color='darkblue', fontfamily='serif')
+
+    q_labels = ['w', 'x', 'y', 'z']
+    for i, label in enumerate(q_labels):
+        time = data['timestamp'][:len(aligned_quaternions)]
+        
+        ax1 = axs[i, 0]
+        ax1.plot(time[::50], aligned_quaternions[::50, i], label='Estimated', color='blue')
+        ax1.plot(time[::50], true_quaternions[::50, i], label='True', color='red', linestyle='--')
+        
+        ax1.set_title(f'Quaternion {label} (RMSE: {rmse_quaternions[i]:.4f})')
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel(f'q_{label}')
+        ax1.legend()
+        ax1.grid(True, linestyle='--', alpha=0.7)
+
+        ax2 = ax1.twinx()
+        ax2.plot(time[::50], thetas[::50], label='Theta', color='green', alpha=0.5)
+        ax2.set_ylabel('Theta', color='green')
+        ax2.tick_params(axis='y', labelcolor='green')
+
+    euler_labels = ['Roll', 'Pitch', 'Yaw']
+    for i, label in enumerate(euler_labels):
+        ax1 = axs[i, 1]
+        ax1.plot(data['timestamp'][:len(aligned_euler_angles):50], aligned_euler_angles[::50, i], label='Estimated', color='blue')
+        ax1.plot(data['timestamp'][:len(true_euler_angles):50], true_euler_angles[::50, i], label='True', color='red', linestyle='--')
+        ax1.set_title(f'{label} (RMSE: {rmse_euler_angles[i]:.4f})')
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel('Angle (degrees)')
+        ax1.legend()
+        ax1.grid(True, linestyle='--', alpha=0.7)
+
+        ax2 = ax1.twinx()
+        ax2.plot(data['timestamp'][:len(thetas):50], thetas[::50], label='Theta', color='green', alpha=0.5)
+        ax2.set_ylabel('Theta', color='green')
+        ax2.tick_params(axis='y', labelcolor='green')
+
+    non_zero_thetas = thetas[thetas != 0]
+    axs[3, 1].hist(non_zero_thetas, bins=50, color='green', alpha=0.7)
+    axs[3, 1].set_title('Histogram of Non-Zero Theta Values')
+    axs[3, 1].set_xlabel('Theta')
+    axs[3, 1].set_ylabel('Frequency')
+    axs[3, 1].grid(True, linestyle='--', alpha=0.7)
+
+    plt.tight_layout()
+    plt.show()
+    print(f"Results plot displayed for {sequence_name}")
+
+def visualize_error(data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles, thetas, sequence_name):
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
+    fig.suptitle('Quaternion and Euler Angle Error Over Time', fontsize=16)
+
+    q_error = np.abs(aligned_quaternions - true_quaternions)
+    ax1.plot(data['timestamp'][:len(q_error):50], q_error[::50, 0], label='w', color='red')
+    ax1.plot(data['timestamp'][:len(q_error):50], q_error[::50, 1], label='x', color='green')
+    ax1.plot(data['timestamp'][:len(q_error):50], q_error[::50, 2], label='y', color='blue')
+    ax1.plot(data['timestamp'][:len(q_error):50], q_error[::50, 3], label='z', color='purple')
+    ax1.set_xlabel('Time')
+    ax1.set_ylabel('Quaternion Error')
+    ax1.legend()
+    ax1.grid(True)
+
+    ax1_twin = ax1.twinx()
+    ax1_twin.plot(data['timestamp'][:len(thetas):50], thetas[::50], label='Theta', color='orange', alpha=0.5)
+    ax1_twin.set_ylabel('Theta', color='orange')
+    ax1_twin.tick_params(axis='y', labelcolor='orange')
+
+    euler_error = np.abs(aligned_euler_angles - true_euler_angles)
+    ax2.plot(data['timestamp'][:len(euler_error):50], euler_error[::50, 0], label='Roll', color='red')
+    ax2.plot(data['timestamp'][:len(euler_error):50], euler_error[::50, 1], label='Pitch', color='green')
+    ax2.plot(data['timestamp'][:len(euler_error):50], euler_error[::50, 2], label='Yaw', color='blue')
+    ax2.set_xlabel('Time')
+    ax2.set_ylabel('Euler Angle Error\n(degrees)')
+    ax2.legend()
+    ax2.grid(True)
+
+    ax2_twin = ax2.twinx()
+    ax2_twin.plot(data['timestamp'][:len(thetas):50], thetas[::50], label='Theta', color='orange', alpha=0.5)
+    ax2_twin.set_ylabel('Theta', color='orange')
+    ax2_twin.tick_params(axis='y', labelcolor='orange')
+
+    plt.tight_layout()
+    plt.show()
+    print(f"Error plot displayed for {sequence_name}")
+
+def make_matching_plot_fast(image0, image1, kpts0, kpts1, mkpts0, mkpts1, color, text, path=None, show_keypoints=False, margin=10, keypoint_size=5):
+    H0, W0 = image0.shape
+    H1, W1 = image1.shape
+    H, W = max(H0, H1), W0 + W1 + margin
+
+    out = np.zeros((H, W), np.uint8)
+    out[:H0, :W0] = image0
+    out[:H1, W0+margin:] = image1
+    out = np.stack([out]*3, -1)
+
+    if show_keypoints:
+        kpts0, kpts1 = np.round(kpts0).astype(int), np.round(kpts1).astype(int)
+        white = (255, 255, 255)
+        black = (0, 0, 0)
+        for x, y in kpts0:
+            cv2.circle(out, (x, y), keypoint_size, black, -1, lineType=cv2.LINE_AA)
+            cv2.circle(out, (x, y), keypoint_size-1, white, -1, lineType=cv2.LINE_AA)
+        for x, y in kpts1:
+            cv2.circle(out, (x + margin + W0, y), keypoint_size, black, -1, lineType=cv2.LINE_AA)
+            cv2.circle(out, (x + margin + W0, y), keypoint_size-1, white, -1, lineType=cv2.LINE_AA)
+
+    mkpts0, mkpts1 = np.round(mkpts0).astype(int), np.round(mkpts1).astype(int)
+    color = (np.array(color[:, :3])*255).astype(int)[:, ::-1]
+    for (x0, y0), (x1, y1), c in zip(mkpts0, mkpts1, color):
+        c = c.tolist()
+        cv2.line(out, (x0, y0), (x1 + margin + W0, y1), color=c, thickness=1, lineType=cv2.LINE_AA)
+        cv2.circle(out, (x0, y0), keypoint_size, c, -1, lineType=cv2.LINE_AA)
+        cv2.circle(out, (x1 + margin + W0, y1), keypoint_size, c, -1, lineType=cv2.LINE_AA)
+
+    sc = min(H / 640., 2.0)
+    Ht = int(30 * sc)
+    txt_color_fg = (255, 255, 255)
+    txt_color_bg = (0, 0, 0)
+    for i, t in enumerate(text):
+        cv2.putText(out, t, (int(8*sc), Ht*(i+1)), cv2.FONT_HERSHEY_DUPLEX,
+                    1.0*sc, txt_color_bg, 2, cv2.LINE_AA)
+        cv2.putText(out, t, (int(8*sc), Ht*(i+1)), cv2.FONT_HERSHEY_DUPLEX,
+                    1.0*sc, txt_color_fg, 1, cv2.LINE_AA)
+
+    if path is not None:
+        cv2.imwrite(str(path), out)
+
+    return out
+
+def process_image_pair(image1_path, image2_path, matching, device):
+    image1 = cv2.imread(str(image1_path), cv2.IMREAD_GRAYSCALE)
+    image2 = cv2.imread(str(image2_path), cv2.IMREAD_GRAYSCALE)
+    
+    tensor1 = frame2tensor(image1, device=device)
+    tensor2 = frame2tensor(image2, device=device)
+
+    with torch.no_grad():
+        pred = matching({'image0': tensor1, 'image1': tensor2})
+    
+    pred = {k: v[0].detach().cpu().numpy() for k, v in pred.items()}
+    kpts0, kpts1 = pred['keypoints0'], pred['keypoints1']
+    matches, conf = pred['matches0'], pred['matching_scores0']
+
+    valid = matches > -1
+    mkpts0 = kpts0[valid]
+    mkpts1 = kpts1[matches[valid]]
+    
+    color = cm.jet(conf[valid])
+    text = [
+        'SuperGlue',
+        f'Matches: {len(mkpts0)}'
+    ]
+    
+    plot = make_matching_plot_fast(
+        image1, image2, kpts0, kpts1, mkpts0, mkpts1, color, text,
+        path=None, show_keypoints=True, keypoint_size=5)
+    
+    return plot
+
+def visualize_superglue(base_path, output_path, config):
+    camera_data_path = base_path / 'cam0/data'
+    output_path = Path(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    image_paths = sorted(camera_data_path.glob("*.png"))
+    matching, device = load_superglue_model(config)
+
+    frame_interval = config['superglue_visualization']['frame_interval']
+    max_pairs = config['superglue_visualization']['max_pairs']
+
+    for i in range(0, min(len(image_paths) - frame_interval, max_pairs * frame_interval), frame_interval):
+        plot = process_image_pair(image_paths[i], image_paths[i + frame_interval], matching, device)
+        
+        fig, ax = plt.subplots(figsize=(20, 10))
+        ax.imshow(plot)
+        ax.axis('off')
+        
+        plt.savefig(output_path / f'superglue_match_{i:04d}.png', bbox_inches='tight', pad_inches=0, dpi=300)
+        plt.close(fig)
+
+    print(f"SuperGlue visualizations saved to {output_path}")
+
+def load_superglue_model(config):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    superglue_config = {
+        'superpoint': {
+            'nms_radius': config['superglue']['nms_radius'],
+            'keypoint_threshold': config['superglue']['keypoint_threshold'],
+            'max_keypoints': config['superglue']['max_keypoints']
+        },
+        'superglue': {
+            'weights': config['superglue']['weights'],
+            'sinkhorn_iterations': config['superglue']['sinkhorn_iterations'],
+            'match_threshold': config['superglue']['match_threshold'],
+        }
+    }
+    matching = Matching(superglue_config).eval().to(device)
+    return matching, device
+
+########################################
+
+# main.py içeriği:
+
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import argparse
+import zipfile
+import io
+import shutil
+import csv
+from urllib.request import urlopen
+from urllib.error import URLError, HTTPError
+from moduls.camera import load_camera_params, load_superglue_model
+from moduls.data_processing import process_imu_data, preprocess_imu_data
+from moduls.visualization import visualize_results, visualize_error, visualize_superglue
+from moduls.confidence_estimation import quadratic_unit_step, cubic_unit_step, quartic_unit_step, relu, double_exponential_sigmoid, triple_exponential_sigmoid, quadruple_exponential_sigmoid, step
+
+DEFAULT_DATASET = "EurocMav"
+DEFAULT_SEQUENCE = "MH_05_difficult"
+BASE_URL = "http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/machine_hall/"
+
+def download_dataset(sequence_name, dataset_path):
+    download_url = f"{BASE_URL}{sequence_name}/{sequence_name}.zip"
+    zip_path = Path(dataset_path) / f"{sequence_name}.zip"
+    extract_path = Path(dataset_path) / sequence_name
+    
+    print(f"Attempting to download from: {download_url}")
+    
+    try:
+        with urlopen(download_url) as response:
+            total_size = int(response.info().get('Content-Length', -1))
+            
+            if total_size < 0:
+                print("Unable to determine file size. Downloading without progress indication.")
+                data = response.read()
+            else:
+                data = io.BytesIO()
+                with tqdm(total=total_size, unit='B', unit_scale=True, desc="Downloading") as pbar:
+                    while True:
+                        chunk = response.read(8192)
+                        if not chunk:
+                            break
+                        data.write(chunk)
+                        pbar.update(len(chunk))
+                data = data.getvalue()
+
+            print("\nDownload complete. Saving and verifying file...")
+            
+            with open(zip_path, 'wb') as f:
+                f.write(data)
+            
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    print("File verified as a valid zip file. Extracting...")
+                    zf.extractall(extract_path)
+                print("Extraction complete.")
+                return True
+            except zipfile.BadZipFile:
+                print("Error: Downloaded file is not a valid zip file.")
+                return False
+    
+    except HTTPError as e:
+        print(f"HTTP Error during download: {e.code} {e.reason}")
+        return False
+    except URLError as e:
+        print(f"URL Error during download: {e.reason}")
+        return False
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return False
+
+def main(args):
+    dataset_path = Path(args.dataset_path)
+    sequence_path = dataset_path / args.sequence
+    
+    if args.download or not sequence_path.exists():
+        success = download_dataset(args.sequence, dataset_path)
+        if not success:
+            print("Failed to download or extract the dataset. Exiting.")
+            return
+
+    base_path = sequence_path / 'mav0'
+    
+    if not base_path.exists():
+        print(f"Dataset structure not found at {base_path}. Please check the dataset path.")
+        return
+
+    imu_file_path = base_path / 'imu0' / 'data.csv'
+    camera_file_path = base_path / 'cam0' / 'data.csv'
+    camera_data_path = base_path / 'cam0' / 'data'
+    camera_yaml_path = base_path / 'cam0' / 'sensor.yaml'
+
+    # Check if all required files exist
+    required_files = [imu_file_path, camera_file_path, camera_yaml_path]
+    for file in required_files:
+        if not file.exists():
+            print(f"Required file not found: {file}")
+            return
+
+    if not camera_data_path.exists():
+        print(f"Camera data directory not found: {camera_data_path}")
+        return
+
+    activation_functions = {
+        'quadratic_unit_step': quadratic_unit_step,
+        'cubic_unit_step': cubic_unit_step,
+        'quartic_unit_step': quartic_unit_step,
+        'relu': relu,
+        'double_exponential_sigmoid': double_exponential_sigmoid,
+        'triple_exponential_sigmoid': triple_exponential_sigmoid,
+        'quadruple_exponential_sigmoid': quadruple_exponential_sigmoid,
+        'step': step
+    }
+
+    config = {
+        'alpha': args.alpha,
+        'beta': args.beta,
+        'gamma': args.gamma,
+        'theta_threshold': args.theta_threshold,
+        'activation_func': activation_functions[args.activation_function],
+        'generate_superglue_visualizations': args.generate_superglue_visualizations,
+        'superglue': {
+            'weights': 'indoor',
+            'sinkhorn_iterations': 20,
+            'match_threshold': 0.2,
+            'keypoint_threshold': 0.005,
+            'max_keypoints': 1000,
+            'nms_radius': 4
+        },
+        'superglue_visualization': {
+            'frame_interval': 10,
+            'max_pairs': 5000
+        }
+    }
+
+    print("Preprocessing IMU data...")
+    preprocess_imu_data(base_path)
+
+    imu_with_groundtruth_path = base_path / 'imu0' / 'imu_with_interpolated_groundtruth.csv'
+    
+    print("Starting VIO processing...")
+    try:
+        data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles, rmse_quaternions, rmse_euler_angles, thetas, timestamps = process_imu_data(
+            str(imu_with_groundtruth_path), str(camera_file_path), str(camera_data_path), str(camera_yaml_path), config, args.sequence, verbose=True)
+        print("Quaternion RMSE:", rmse_quaternions)
+        print("Euler Angle RMSE:", rmse_euler_angles)
+        
+        # Use the dataset name for the CSV file
+        output_file = f'{args.sequence}_estimated_values.csv'
+        with open(output_file, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['Timestamp', 'q_w', 'q_x', 'q_y', 'q_z', 'roll', 'pitch', 'yaw', 'theta'])
+            for t, q, e, theta in zip(timestamps, aligned_quaternions, aligned_euler_angles, thetas):
+                writer.writerow([t] + list(q) + list(e) + [theta])
+        print(f"Estimated values saved to {output_file}")
+        
+        print("Generating visualizations...")
+        visualize_results(data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles, rmse_quaternions, rmse_euler_angles, thetas, args.sequence)
+        visualize_error(data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles, thetas, args.sequence)
+        
+        if config['generate_superglue_visualizations']:
+            print("Generating SuperGlue visualizations...")
+            superglue_output_dir = f'super-out_{args.sequence}'
+            visualize_superglue(base_path, superglue_output_dir, config)
+        
+        print("VIO processing completed successfully.")
+    except Exception as e:
+        print(f"An error occurred during VIO processing: {e}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Visual Inertial Odometry Processing")
+    parser.add_argument("--dataset_path", type=str, default=".", help="Path to save the dataset (default: current directory)")
+    parser.add_argument("--sequence", type=str, default=DEFAULT_SEQUENCE, help=f"Dataset sequence to use (default: {DEFAULT_SEQUENCE})")
+    parser.add_argument("--download", action="store_true", help="Force download the dataset even if it exists")
+    parser.add_argument("--alpha", type=float, default=1.05, help="Alpha parameter (default: 1.05)")
+    parser.add_argument("--beta", type=float, default=1.05, help="Beta parameter (default: 1.05)")
+    parser.add_argument("--gamma", type=float, default=1, help="Gamma parameter (default: 1)")
+    parser.add_argument("--theta_threshold", type=float, default=0.30, help="Theta threshold (default: 0.3)")
+    parser.add_argument("--activation_function", type=str, 
+                        choices=['quadratic_unit_step', 'cubic_unit_step', 'quartic_unit_step','relu', 'double_exponential_sigmoid', 'triple_exponential_sigmoid','quadruple_exponential_sigmoid', 'step'], 
+                        default='double_exponential_sigmoid', 
+                        help="Activation function to use (default: double_exponential_sigmoid)")
+    parser.add_argument("--generate_superglue_visualizations", action="store_true", help="Generate SuperGlue visualizations")
+    
+    args = parser.parse_args()
+    main(args)
+
+
+########################################
+
