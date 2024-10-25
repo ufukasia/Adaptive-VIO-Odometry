@@ -80,10 +80,10 @@ python main.py [OPTIONS]
 - `--dataset_path`: Path to save the dataset (default: current directory)
 - `--sequence`: Dataset sequence to use (default: MH_05_difficult)
 - `--download`: Force download the dataset even if it exists
-- `--alpha`: Alpha parameter for confidence estimation (default: 1.05)
-- `--beta`: Beta parameter for confidence estimation (default: 1.05)
+- `--alpha`: Alpha parameter for confidence estimation (default: 1)
+- `--beta`: Beta parameter for confidence estimation (default: 1)
 - `--gamma`: Gamma parameter for confidence estimation (default: 1)
-- `--theta_threshold`: Theta threshold for adaptive fusion (default: 0.3)
+- `--theta_threshold`: Theta threshold for adaptive fusion (default: 0.25)
 - `--activation_function`: Activation function to use for confidence estimation (default: double_exponential_sigmoid)
 - `--generate_superglue_visualizations`: Generate SuperGlue visualizations
 
