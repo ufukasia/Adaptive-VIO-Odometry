@@ -1,0 +1,2272 @@
+# camera.py içeriği:
+
+import yaml
+import cv2
+import torch
+import numpy as np
+from models.matching import Matching
+from models.utils import frame2tensor
+
+def load_camera_params(yaml_file):
+    with open(yaml_file, 'r') as file:
+        params = yaml.safe_load(file)
+    
+    intrinsics = params['intrinsics']
+    camera_matrix = np.array([
+        [intrinsics[0], 0, intrinsics[2]],
+        [0, intrinsics[1], intrinsics[3]],
+        [0, 0, 1]
+    ])
+    dist_coeffs = np.array(params['distortion_coefficients'])
+    
+    return camera_matrix, dist_coeffs
+
+def load_superglue_model(config):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    superglue_config = {
+        'superpoint': {
+            'nms_radius': config['superglue']['nms_radius'],
+            'keypoint_threshold': config['superglue']['keypoint_threshold'],
+            'max_keypoints': config['superglue']['max_keypoints']
+        },
+        'superglue': {
+            'weights': config['superglue']['weights'],
+            'sinkhorn_iterations': config['superglue']['sinkhorn_iterations'],
+            'match_threshold': config['superglue']['match_threshold'],
+        }
+    }
+    
+    try:
+        matching = Matching(superglue_config).eval().to(device)
+        print("SuperGlue model loaded successfully")
+        
+        # Test the model with dummy input
+        dummy_input = torch.randn(1, 1, 480, 752).to(device)
+        try:
+            with torch.no_grad():
+                _ = matching({'image0': dummy_input, 'image1': dummy_input})
+            print("SuperGlue model test passed")
+        except Exception as e:
+            print(f"Error during SuperGlue model test: {e}")
+        
+        return matching, device
+    except Exception as e:
+        print(f"Error loading SuperGlue model: {e}")
+        print(f"SuperGlue config: {superglue_config}")
+        raise
+
+def report_outlier_method(method, threshold):
+    if method == 'ransac':
+        print(f"Using RANSAC with threshold: {threshold}")
+    elif method == 'distance':
+        print(f"Using distance-based filtering with threshold: {threshold}")
+    elif method == 'confidence':
+        print(f"Using confidence-based filtering with threshold: {threshold}")
+
+def match_features_superglue(img1, img2, matching, device, outlier_method='ransac', ransac_threshold=3.0, distance_threshold=10.0, confidence_threshold=0.5):
+    # Convert images to tensors
+    frame_tensor1 = frame2tensor(img1, device)
+    frame_tensor2 = frame2tensor(img2, device)
+    
+    # Perform the matching
+    with torch.no_grad():
+        pred = matching({'image0': frame_tensor1, 'image1': frame_tensor2})
+    
+    # Detach tensors and convert to numpy arrays
+    pred = {k: v[0].detach().cpu().numpy() for k, v in pred.items()}
+    kpts0, kpts1 = pred['keypoints0'], pred['keypoints1']
+    matches, conf = pred['matches0'], pred['matching_scores0']
+    
+    # Keep the matching points
+    valid = matches > -1
+    mkpts0 = kpts0[valid]
+    mkpts1 = kpts1[matches[valid]]
+    mconf = conf[valid]
+    
+    initial_matches = len(mkpts0)
+    
+    if outlier_method == 'ransac':
+        if len(mkpts0) >= 8 and len(mkpts1) >= 8:
+            _, mask = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, ransac_threshold)
+            if mask is not None:
+                mask = mask.ravel() != 0
+                mkpts0 = mkpts0[mask]
+                mkpts1 = mkpts1[mask]
+                mconf = mconf[mask]
+    elif outlier_method == 'distance':
+        distances = np.linalg.norm(mkpts0 - mkpts1, axis=1)
+        mask = distances < distance_threshold
+        mkpts0 = mkpts0[mask]
+        mkpts1 = mkpts1[mask]
+        mconf = mconf[mask]
+    elif outlier_method == 'confidence':
+        mask = mconf > confidence_threshold
+        mkpts0 = mkpts0[mask]
+        mkpts1 = mkpts1[mask]
+        mconf = mconf[mask]
+    
+    filtered_matches = len(mkpts0)
+    
+    return mkpts0, mkpts1, initial_matches, filtered_matches
+
+def detect_features(image_path, prev_image_path, matching, device, outlier_method='ransac', ransac_threshold=0.5, distance_threshold=5.0, confidence_threshold=0.9, verbose=False):
+    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    
+    if prev_image_path is not None:
+        prev_image = cv2.imread(prev_image_path, cv2.IMREAD_GRAYSCALE)
+        src_pts, dst_pts, initial_matches, filtered_matches = match_features_superglue(prev_image, image, matching, device, 
+                                                    outlier_method, ransac_threshold, 
+                                                    distance_threshold, confidence_threshold)
+        return src_pts, dst_pts, initial_matches, filtered_matches
+    else:
+        return None, None, 0, 0
+
+if __name__ == "__main__":
+    print("This module is not meant to be run directly. Please use main-vio-file.py instead.")
+
+########################################
+
+# confidence_estimation.py içeriği:
+
+import numpy as np
+import cv2
+
+def quadratic_unit_step(x):
+    return np.minimum(x**2, 1)
+
+def cubic_unit_step(x):
+    return np.minimum(x**3, 1)
+
+def quartic_unit_step(x):
+    return np.minimum(x**4, 1)
+
+def relu(x):
+    return np.maximum(0, x)
+
+def double_exponential_sigmoid(x):
+    return (np.exp(x) - np.exp(-x)) / (np.exp(x) + np.exp(-x))
+
+def triple_exponential_sigmoid(x):
+    return (np.exp(x) - np.exp(-x)) / (np.exp(x) + np.exp(-x) + np.exp(-2*x))
+
+def quadruple_exponential_sigmoid(x):
+    return (np.exp(x) - np.exp(-x)) / (np.exp(x) + np.exp(-x) + np.exp(-2*x) + np.exp(-3*x))
+
+def step(x):
+    return np.where(x >= 0, 1, 0)
+
+class AdaptivePositiveNormalizer:
+    def __init__(self, initial_value=0, alpha=0.01):
+        self.mean = max(initial_value, 0)
+        self.max_value = max(initial_value, 1e-6)  # Avoid division by zero
+        self.alpha = alpha  # Learning rate for the running statistics
+
+    def update(self, value):
+        value = max(value, 0)  # Ensure non-negative value
+        self.mean = (1 - self.alpha) * self.mean + self.alpha * value
+        self.max_value = max(self.max_value, value)
+
+    def normalize(self, value):
+        value = max(value, 0)  # Ensure non-negative value
+        if self.max_value == 0:
+            return 0
+        return value / self.max_value
+
+def normalize_delta_intensity(delta):
+    """
+    Delta intensity değerlerini 0-256 aralığında normalize eder.
+    """
+    return min(delta, 256) / 256
+
+def estimate_confidence(image, prev_intensity, config):
+    intensity = calculate_intensity(image)
+    entropy = calculate_entropy(image)
+    motion_blur = calculate_motion_blur(image)
+    
+    intensity_normalizer = AdaptivePositiveNormalizer()
+    motion_blur_normalizer = AdaptivePositiveNormalizer()
+    
+    intensity_normalizer.update(intensity)
+    motion_blur_normalizer.update(motion_blur)
+    
+    normalized_intensity = intensity_normalizer.normalize(intensity)
+    normalized_entropy = entropy / 8  # Entropi değerini 8'e bölerek normalize ediyoruz
+    normalized_motion_blur = motion_blur_normalizer.normalize(motion_blur)
+    
+    scaled_entropy = (1 - normalized_entropy) * config['beta']
+    scaled_motion_blur = normalized_motion_blur * config['gamma'] * 0.2
+    
+    if prev_intensity is not None:
+        delta_intensity = abs(intensity - prev_intensity)
+        normalized_delta_intensity = normalize_delta_intensity(delta_intensity * 255)
+        scaled_delta_intensity = normalized_delta_intensity * config['alpha'] * 10
+        
+        combined_value = max(scaled_delta_intensity, scaled_entropy, scaled_motion_blur)
+        
+        if combined_value > config['theta_threshold']:
+            theta = config['activation_func'](combined_value - config['theta_threshold'])
+        else:
+            theta = 0
+    else:
+        theta = 0
+    
+    return intensity, entropy, theta
+
+def calculate_intensity(image):
+    return np.mean(image) / 255.0
+
+def calculate_entropy(image):
+    histogram = cv2.calcHist([image], [0], None, [256], [0, 256])
+    histogram = histogram.flatten() / np.sum(histogram)
+    non_zero = histogram[histogram > 0]
+    return -np.sum(non_zero * np.log2(non_zero))
+
+def calculate_motion_blur(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+########################################
+
+# data_processing.py içeriği:
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import os
+import cv2
+import torch
+from pathlib import Path
+from .ekf import ExtendedKalmanFilter, quaternion_to_euler, ensure_quaternion_continuity, align_quaternions, ensure_angle_continuity
+from .camera import load_camera_params, load_superglue_model, match_features_superglue, detect_features
+from .confidence_estimation import estimate_confidence
+from models.utils import frame2tensor
+
+def process_imu_data(imu_file_path, camera_file_path, camera_data_path, camera_yaml_path, config, sequence_name, verbose=False):
+    try:
+        camera_matrix, dist_coeffs = load_camera_params(camera_yaml_path)
+
+        calibration = {
+            'w_RS_S_x [rad s^-1]': -0.003342,
+            'w_RS_S_y [rad s^-1]': 0.020582,
+            'w_RS_S_z [rad s^-1]': 0.079360,
+            'a_RS_S_x [m s^-2]': 0.045,
+            'a_RS_S_y [m s^-2]': 0.124,
+            'a_RS_S_z [m s^-2]': 0.0628
+        }
+
+        imu_data = pd.read_csv(imu_file_path)
+        camera_data = pd.read_csv(camera_file_path)
+
+        initial_quaternion = imu_data[[' q_RS_w []', ' q_RS_x []', ' q_RS_y []', ' q_RS_z []']].iloc[0].values
+
+        imu_data['timestamp'] = pd.to_datetime(imu_data['#timestamp [ns]'], unit='ns')
+        imu_data['dt'] = imu_data['timestamp'].diff().dt.total_seconds()
+        imu_data.loc[0, 'dt'] = 0
+
+        for key in calibration:
+            imu_data[key] = imu_data[key] - calibration[key]
+
+        ekf = ExtendedKalmanFilter(initial_quaternion=initial_quaternion, 
+                                   camera_matrix=camera_matrix, 
+                                   dist_coeffs=dist_coeffs,
+                                   theta_threshold=config['theta_threshold'])
+
+        estimated_quaternions = []
+        estimated_euler_angles = []
+        thetas = []
+        timestamps = []
+        q_prev = initial_quaternion
+
+        prev_image_path = None
+        prev_intensity = None
+
+        try:
+            matching, device = load_superglue_model(config)
+            if verbose:
+                print("SuperGlue model loaded successfully")
+        except Exception as e:
+            if verbose:
+                print(f"Error loading SuperGlue model: {e}")
+            matching, device = None, None
+
+        progress_bar = tqdm(total=len(imu_data), desc="Processing IMU data")
+
+        match_data = []  # New list to store match data
+
+        for _, row in imu_data.iterrows():
+            gyro = np.array([row['w_RS_S_x [rad s^-1]'], row['w_RS_S_y [rad s^-1]'], row['w_RS_S_z [rad s^-1]']])
+            accel = np.array([row['a_RS_S_x [m s^-2]'], row['a_RS_S_y [m s^-2]'], row['a_RS_S_z [m s^-2]']])
+            
+            camera_row = camera_data[camera_data['#timestamp [ns]'] == row['#timestamp [ns]']]
+            
+            if not camera_row.empty:
+                image_path = os.path.join(camera_data_path, camera_row['filename'].values[0])
+                image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+                intensity, entropy, theta = estimate_confidence(image, prev_intensity, config)
+                thetas.append(theta)
+                
+                if matching is not None and device is not None:
+                    try:
+                        src_pts, dst_pts, initial_matches, filtered_matches = detect_features(
+                            image_path=image_path,
+                            prev_image_path=prev_image_path,
+                            matching=matching,
+                            device=device,
+                            outlier_method='distance',
+                            ransac_threshold=0.5,
+                            distance_threshold=5.0,
+                            confidence_threshold=0.9,
+                            verbose=verbose
+                        )
+                        match_data.append({
+                            'timestamp': row['#timestamp [ns]'],
+                            'initial_matches': initial_matches,
+                            'filtered_matches': filtered_matches
+                        })
+                    except Exception as e:
+                        if verbose:
+                            print(f"Error detecting features: {e}")
+                        src_pts, dst_pts = None, None
+                else:
+                    src_pts, dst_pts = None, None
+                
+                prev_image_path = image_path
+                prev_intensity = intensity
+                
+                if src_pts is not None and dst_pts is not None:
+                    world_points = np.hstack((src_pts.reshape(-1, 2), np.zeros((src_pts.shape[0], 1))))
+                    image_points = dst_pts.reshape(-1, 2)
+                else:
+                    world_points, image_points = None, None
+            else:
+                world_points, image_points = None, None
+                theta = thetas[-1] if thetas else 0
+                thetas.append(theta)
+            
+            q = ekf.update(gyro, accel, image_points, world_points, row['dt'], theta)
+            q = ensure_quaternion_continuity(q, q_prev)
+            estimated_quaternions.append(q)
+            estimated_euler_angles.append(quaternion_to_euler(q))
+            timestamps.append(row['#timestamp [ns]'])
+            q_prev = q
+
+            progress_bar.update(1)
+
+        progress_bar.close()
+
+        # Save match data to CSV with sequence name
+        match_df = pd.DataFrame(match_data)
+        match_output_file = f'{sequence_name}_match_data.csv'
+        match_df.to_csv(match_output_file, index=False)
+        if verbose:
+            print(f"Match data saved to {match_output_file}")
+
+        estimated_quaternions = np.array(estimated_quaternions)
+        estimated_euler_angles = np.array(estimated_euler_angles)
+        thetas = np.array(thetas)
+
+        true_quaternions = imu_data[[' q_RS_w []', ' q_RS_x []', ' q_RS_y []', ' q_RS_z []']].values
+        true_euler_angles = np.array([quaternion_to_euler(q) for q in true_quaternions])
+
+        aligned_quaternions = align_quaternions(estimated_quaternions, true_quaternions)
+        aligned_euler_angles = np.array([quaternion_to_euler(q) for q in aligned_quaternions])
+
+        aligned_euler_angles = ensure_angle_continuity(aligned_euler_angles)
+        true_euler_angles = ensure_angle_continuity(true_euler_angles[:len(aligned_euler_angles)])
+
+        rmse_quaternions = np.sqrt(((aligned_quaternions - true_quaternions[:len(aligned_quaternions)]) ** 2).mean(axis=0))
+        rmse_euler_angles = calculate_angle_rmse(aligned_euler_angles, true_euler_angles)
+
+        return imu_data, aligned_quaternions, aligned_euler_angles, true_quaternions[:len(aligned_quaternions)], true_euler_angles, rmse_quaternions, rmse_euler_angles, thetas, timestamps
+
+    except Exception as e:
+        if verbose:
+            print(f"An error occurred in process_imu_data: {e}")
+        raise
+
+def calculate_angle_rmse(predictions, targets):
+    diff = np.array([angle_difference(p, t) for p, t in zip(predictions, targets)])
+    return np.sqrt((diff ** 2).mean(axis=0))
+
+def angle_difference(angle1, angle2):
+    diff = angle1 - angle2
+    return (diff + 180) % 360 - 180
+
+def preprocess_imu_data(base_path, cam_to_imu_timeshift=5.63799926987e-05):
+    try:
+        # Verileri okuma
+        imu_df = pd.read_csv(base_path / 'imu0/data.csv')
+        groundtruth_df = pd.read_csv(base_path / 'state_groundtruth_estimate0/data.csv')
+        
+        # Nanosaniye cinsinden timeshift hesaplama
+        timeshift_ns = int(cam_to_imu_timeshift * 1e9)
+        
+        # Groundtruth verilerindeki timestamp'leri düzeltme
+        # t_imu = t_cam + shift formülüne göre
+        groundtruth_df['#timestamp'] = groundtruth_df['#timestamp'].apply(
+            lambda x: x + timeshift_ns
+        )
+        
+        groundtruth_df.set_index('#timestamp', inplace=True)
+        groundtruth_df.sort_index(inplace=True)
+        
+        velocity_cols = [' v_RS_R_x [m s^-1]', ' v_RS_R_y [m s^-1]', ' v_RS_R_z [m s^-1]']
+        quaternion_cols = [' q_RS_w []', ' q_RS_x []', ' q_RS_y []', ' q_RS_z []']
+        
+        # Zaman kayması düzeltilmiş timestamp'leri kullanarak interpolasyon
+        for col in velocity_cols + quaternion_cols:
+            if col in groundtruth_df.columns:
+                imu_df[col] = np.interp(imu_df['#timestamp [ns]'], 
+                                      groundtruth_df.index.values,
+                                      groundtruth_df[col].values)
+        
+        output_file = base_path / 'imu0/imu_with_interpolated_groundtruth.csv'
+        imu_df.to_csv(output_file, index=False)
+        print(f"Preprocessed IMU data saved to {output_file}")
+        
+        # Düzeltme miktarını kontrol etmek için bilgi yazdırma
+        print(f"Applied timeshift correction: {timeshift_ns} ns ({cam_to_imu_timeshift} s)")
+        
+    except Exception as e:
+        print(f"An error occurred during preprocessing: {e}")
+        raise
+
+if __name__ == "__main__":
+    print("This module is not meant to be run directly. Please use main.py instead.")
+
+########################################
+
+# ekf.py içeriği:
+
+import numpy as np
+from scipy.spatial.transform import Rotation
+import cv2
+
+class ExtendedKalmanFilter:
+    def __init__(self, initial_quaternion, camera_matrix, dist_coeffs, theta_threshold, 
+                 process_noise_scale=1e-10, measurement_noise_scale=1e-3):
+        self.q = initial_quaternion
+        self.P = np.diag([1e-10, 1e-10, 1e-10, 1e-10])
+        self.Q = np.diag([process_noise_scale] * 4)
+        self.R_camera = np.diag([measurement_noise_scale, measurement_noise_scale])
+        self.R_imu = np.diag([0.0001, 0.001, 0.001, 0.00001, 0.00001, 0.00001])
+        self.theta_threshold = theta_threshold
+        self.camera_matrix = camera_matrix
+        self.dist_coeffs = dist_coeffs
+
+    def update(self, gyroscope, accelerometer, image_points, world_points, dt, theta, 
+               camera_weight=0.5, imu_weight=0.5):
+        q = self.q
+        if np.all(accelerometer == 0) and np.all(gyroscope == 0):
+            return self.q
+        if np.linalg.norm(accelerometer) != 0:
+            accelerometer = accelerometer / np.linalg.norm(accelerometer)
+        q_pred = self.predict(q, gyroscope, dt)
+        
+        deadline = 0.50
+
+        if theta > deadline:
+            self.q = self.update_imu_only(q_pred, gyroscope, accelerometer)
+        elif image_points is not None and world_points is not None and len(image_points) >= 4:
+            if theta <= self.theta_threshold:
+                q_camera = self.update_with_camera(q_pred, image_points, world_points, gyroscope, accelerometer)
+                q_imu = self.update_imu_only(q_pred, gyroscope, accelerometer)
+                self.q = self.weighted_quaternion_average([q_camera, q_imu], [camera_weight, imu_weight])
+            else:
+                camera_reliability = max(0, (deadline - theta) / (deadline - self.theta_threshold))
+                q_camera = self.update_with_camera(q_pred, image_points, world_points, gyroscope, accelerometer)
+                q_imu = self.update_imu_only(q_pred, gyroscope, accelerometer)
+                self.q = self.weighted_quaternion_average([q_camera, q_imu], [camera_reliability * camera_weight, (1 - camera_reliability) * imu_weight])
+        else:
+            self.q = self.update_imu_only(q_pred, gyroscope, accelerometer)
+        return self.q
+
+    def predict(self, q, gyroscope, dt):
+        omega = np.array([0, *gyroscope])
+        q_dot = 0.5 * self.quaternion_multiply(q, omega)
+        q_pred = q + q_dot * dt
+        q_pred = q_pred / np.linalg.norm(q_pred)
+        
+        F = self.calculate_state_transition_matrix(q, gyroscope, dt)
+        self.P = F @ self.P @ F.T + self.Q
+        
+        return q_pred
+
+    def calculate_state_transition_matrix(self, q, gyroscope, dt):
+        F = np.eye(4) + dt * 0.5 * np.array([
+            [0, -gyroscope[0], -gyroscope[1], -gyroscope[2]],
+            [gyroscope[0], 0, gyroscope[2], -gyroscope[1]],
+            [gyroscope[1], -gyroscope[2], 0, gyroscope[0]],
+            [gyroscope[2], gyroscope[1], -gyroscope[0], 0]
+        ])
+        return F
+
+    def update_imu_only(self, q_pred, gyroscope, accelerometer):
+        F_imu = np.array([
+            2*(q_pred[1]*q_pred[3] - q_pred[0]*q_pred[2]) - accelerometer[0],
+            2*(q_pred[0]*q_pred[1] + q_pred[2]*q_pred[3]) - accelerometer[1],
+            2*(0.5 - q_pred[1]**2 - q_pred[2]**2) - accelerometer[2],
+            *gyroscope
+        ])
+        J_imu = np.array([
+            [-2*q_pred[2], 2*q_pred[3], -2*q_pred[0], 2*q_pred[1]],
+            [2*q_pred[1], 2*q_pred[0], 2*q_pred[3], 2*q_pred[2]],
+            [0, -4*q_pred[1], -4*q_pred[2], 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0]
+        ])
+
+        H = J_imu
+        y = -F_imu
+        R = self.R_imu
+
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        
+        x_update = K @ y
+        q_update = x_update[:4]
+
+        q = q_pred + q_update
+        q = q / np.linalg.norm(q)
+
+        self.P = (np.eye(4) - K @ H) @ self.P
+
+        return q
+
+    def update_with_camera(self, q_pred, image_points, world_points, gyroscope, accelerometer):
+        success, rvec, tvec = self.pnp_solve(world_points, image_points, q_pred)
+        
+        if not success:
+            return self.update_imu_only(q_pred, gyroscope, accelerometer)
+        
+        r_mat, _ = cv2.Rodrigues(rvec)
+        q_camera = Rotation.from_matrix(r_mat).as_quat()
+        
+        y_camera = q_camera - q_pred
+        
+        H_camera = np.eye(4)
+        
+        F_imu = np.array([
+            2*(q_pred[1]*q_pred[3] - q_pred[0]*q_pred[2]) - accelerometer[0],
+            2*(q_pred[0]*q_pred[1] + q_pred[2]*q_pred[3]) - accelerometer[1],
+            2*(0.5 - q_pred[1]**2 - q_pred[2]**2) - accelerometer[2],
+            *gyroscope
+        ])
+        J_imu = np.array([
+            [-2*q_pred[2], 2*q_pred[3], -2*q_pred[0], 2*q_pred[1]],
+            [2*q_pred[1], 2*q_pred[0], 2*q_pred[3], 2*q_pred[2]],
+            [0, -4*q_pred[1], -4*q_pred[2], 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0]
+        ])
+        
+        H = np.vstack((J_imu, H_camera))
+        y = np.concatenate((-F_imu, y_camera))
+        R = np.block([
+            [self.R_imu, np.zeros((6, 4))],
+            [np.zeros((4, 6)), np.eye(4) * self.R_camera[0, 0]]
+        ])
+
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        
+        x_update = K @ y
+        q_update = x_update[:4]
+
+        q = q_pred + q_update
+        q = q / np.linalg.norm(q)
+
+        self.P = (np.eye(4) - K @ H) @ self.P
+
+        return q
+
+    def quaternion_multiply(self, q1, q2):
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        y = w1 * y2 + y1 * w2 + z1 * x2 - x1 * z2
+        z = w1 * z2 + z1 * w2 + x1 * y2 - y1 * x2
+        return np.array([w, x, y, z])
+
+    def pnp_solve(self, world_points, image_points, q_pred):
+        if len(world_points) < 4:
+            return False, None, None
+        
+        rvec_init = Rotation.from_quat(q_pred).as_rotvec()
+        tvec_init = np.zeros(3)
+        
+        try:
+            success, rvec, tvec = cv2.solvePnP(world_points, image_points, self.camera_matrix, self.dist_coeffs,
+                                               rvec=rvec_init, tvec=tvec_init, useExtrinsicGuess=True)
+        except cv2.error:
+            return False, None, None
+        
+        return success, rvec, tvec
+
+    def weighted_quaternion_average(self, quaternions, weights):
+        avg = np.zeros(4)
+        for q, w in zip(quaternions, weights):
+            avg += q * w
+        avg = avg / np.linalg.norm(avg)
+        return avg
+
+# Yardımcı fonksiyonlar
+def quaternion_to_euler(q):
+    r = Rotation.from_quat(q)
+    return r.as_euler('xyz', degrees=True)
+
+def ensure_quaternion_continuity(q, q_prev):
+    if np.dot(q, q_prev) < 0:
+        return -q
+    return q
+
+def align_quaternions(estimated_quaternions, true_quaternions):
+    min_length = min(len(estimated_quaternions), len(true_quaternions))
+    aligned_quaternions = np.copy(estimated_quaternions[:min_length])
+    for i in range(min_length):
+        if np.dot(estimated_quaternions[i], true_quaternions[i]) < 0:
+            aligned_quaternions[i] = -aligned_quaternions[i]
+    return aligned_quaternions
+
+def ensure_angle_continuity(angles, threshold=180):
+    return np.unwrap(angles, axis=0, period=2*threshold)
+
+def calculate_angle_rmse(predictions, targets):
+    diff = np.array([angle_difference(p, t) for p, t in zip(predictions, targets)])
+    return np.sqrt((diff ** 2).mean(axis=0))
+
+def angle_difference(angle1, angle2):
+    diff = angle1 - angle2
+    return (diff + 180) % 360 - 180
+
+########################################
+
+# visualization.py içeriği:
+
+import matplotlib.pyplot as plt
+import numpy as np
+import cv2
+import torch
+from pathlib import Path
+import matplotlib.cm as cm
+from models.matching import Matching
+from models.utils import frame2tensor
+
+# Try setting a different backend for matplotlib
+plt.switch_backend('TkAgg')
+
+def visualize_results(data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles, rmse_quaternions, rmse_euler_angles, thetas, sequence_name):
+    fig, axs = plt.subplots(4, 2, figsize=(15, 20))
+    fig.suptitle('Pose Estimation Errors', fontsize=16, fontweight='bold', color='darkblue', fontfamily='serif')
+
+    q_labels = ['w', 'x', 'y', 'z']
+    for i, label in enumerate(q_labels):
+        time = data['timestamp'][:len(aligned_quaternions)]
+        
+        ax1 = axs[i, 0]
+        ax1.plot(time[::50], aligned_quaternions[::50, i], label='Estimated', color='blue')
+        ax1.plot(time[::50], true_quaternions[::50, i], label='True', color='red', linestyle='--')
+        
+        ax1.set_title(f'Quaternion {label} (RMSE: {rmse_quaternions[i]:.4f})')
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel(f'q_{label}')
+        ax1.legend()
+        ax1.grid(True, linestyle='--', alpha=0.7)
+
+        ax2 = ax1.twinx()
+        ax2.plot(time[::50], thetas[::50], label='Theta', color='green', alpha=0.5)
+        ax2.set_ylabel('Theta', color='green')
+        ax2.tick_params(axis='y', labelcolor='green')
+
+    euler_labels = ['Roll', 'Pitch', 'Yaw']
+    for i, label in enumerate(euler_labels):
+        ax1 = axs[i, 1]
+        ax1.plot(data['timestamp'][:len(aligned_euler_angles):50], aligned_euler_angles[::50, i], label='Estimated', color='blue')
+        ax1.plot(data['timestamp'][:len(true_euler_angles):50], true_euler_angles[::50, i], label='True', color='red', linestyle='--')
+        ax1.set_title(f'{label} (RMSE: {rmse_euler_angles[i]:.4f})')
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel('Angle (degrees)')
+        ax1.legend()
+        ax1.grid(True, linestyle='--', alpha=0.7)
+
+        ax2 = ax1.twinx()
+        ax2.plot(data['timestamp'][:len(thetas):50], thetas[::50], label='Theta', color='green', alpha=0.5)
+        ax2.set_ylabel('Theta', color='green')
+        ax2.tick_params(axis='y', labelcolor='green')
+
+    non_zero_thetas = thetas[thetas != 0]
+    axs[3, 1].hist(non_zero_thetas, bins=50, color='green', alpha=0.7)
+    axs[3, 1].set_title('Histogram of Non-Zero Theta Values')
+    axs[3, 1].set_xlabel('Theta')
+    axs[3, 1].set_ylabel('Frequency')
+    axs[3, 1].grid(True, linestyle='--', alpha=0.7)
+
+    plt.tight_layout()
+    plt.show()
+    print(f"Results plot displayed for {sequence_name}")
+
+def visualize_error(data, aligned_quaternions, aligned_euler_angles, true_quaternions, true_euler_angles, thetas, sequence_name):
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
+    fig.suptitle('Quaternion and Euler Angle Error Over Time', fontsize=16)
+
+    q_error = np.abs(aligned_quaternions - true_quaternions)
+    ax1.plot(data['timestamp'][:len(q_error):50], q_error[::50, 0], label='w', color='red')
+    ax1.plot(data['timestamp'][:len(q_error):50], q_error[::50, 1], label='x', color='green')
+    ax1.plot(data['timestamp'][:len(q_error):50], q_error[::50, 2], label='y', color='blue')
+    ax1.plot(data['timestamp'][:len(q_error):50], q_error[::50, 3], label='z', color='purple')
+    ax1.set_xlabel('Time')
+    ax1.set_ylabel('Quaternion Error')
+    ax1.legend()
+    ax1.grid(True)
+
+    ax1_twin = ax1.twinx()
+    ax1_twin.plot(data['timestamp'][:len(thetas):50], thetas[::50], label='Theta', color='orange', alpha=0.5)
+    ax1_twin.set_ylabel('Theta', color='orange')
+    ax1_twin.tick_params(axis='y', labelcolor='orange')
+
+    euler_error = np.abs(aligned_euler_angles - true_euler_angles)
+    ax2.plot(data['timestamp'][:len(euler_error):50], euler_error[::50, 0], label='Roll', color='red')
+    ax2.plot(data['timestamp'][:len(euler_error):50], euler_error[::50, 1], label='Pitch', color='green')
+    ax2.plot(data['timestamp'][:len(euler_error):50], euler_error[::50, 2], label='Yaw', color='blue')
+    ax2.set_xlabel('Time')
+    ax2.set_ylabel('Euler Angle Error\n(degrees)')
+    ax2.legend()
+    ax2.grid(True)
+
+    ax2_twin = ax2.twinx()
+    ax2_twin.plot(data['timestamp'][:len(thetas):50], thetas[::50], label='Theta', color='orange', alpha=0.5)
+    ax2_twin.set_ylabel('Theta', color='orange')
+    ax2_twin.tick_params(axis='y', labelcolor='orange')
+
+    plt.tight_layout()
+    plt.show()
+    print(f"Error plot displayed for {sequence_name}")
+
+def make_matching_plot_fast(image0, image1, kpts0, kpts1, mkpts0, mkpts1, color, text, path=None, show_keypoints=False, margin=10, keypoint_size=5):
+    H0, W0 = image0.shape
+    H1, W1 = image1.shape
+    H, W = max(H0, H1), W0 + W1 + margin
+
+    out = np.zeros((H, W), np.uint8)
+    out[:H0, :W0] = image0
+    out[:H1, W0+margin:] = image1
+    out = np.stack([out]*3, -1)
+
+    if show_keypoints:
+        kpts0, kpts1 = np.round(kpts0).astype(int), np.round(kpts1).astype(int)
+        white = (255, 255, 255)
+        black = (0, 0, 0)
+        for x, y in kpts0:
+            cv2.circle(out, (x, y), keypoint_size, black, -1, lineType=cv2.LINE_AA)
+            cv2.circle(out, (x, y), keypoint_size-1, white, -1, lineType=cv2.LINE_AA)
+        for x, y in kpts1:
+            cv2.circle(out, (x + margin + W0, y), keypoint_size, black, -1, lineType=cv2.LINE_AA)
+            cv2.circle(out, (x + margin + W0, y), keypoint_size-1, white, -1, lineType=cv2.LINE_AA)
+
+    mkpts0, mkpts1 = np.round(mkpts0).astype(int), np.round(mkpts1).astype(int)
+    color = (np.array(color[:, :3])*255).astype(int)[:, ::-1]
+    for (x0, y0), (x1, y1), c in zip(mkpts0, mkpts1, color):
+        c = c.tolist()
+        cv2.line(out, (x0, y0), (x1 + margin + W0, y1), color=c, thickness=1, lineType=cv2.LINE_AA)
+        cv2.circle(out, (x0, y0), keypoint_size, c, -1, lineType=cv2.LINE_AA)
+        cv2.circle(out, (x1 + margin + W0, y1), keypoint_size, c, -1, lineType=cv2.LINE_AA)
+
+    sc = min(H / 640., 2.0)
+    Ht = int(30 * sc)
+    txt_color_fg = (255, 255, 255)
+    txt_color_bg = (0, 0, 0)
+    for i, t in enumerate(text):
+        cv2.putText(out, t, (int(8*sc), Ht*(i+1)), cv2.FONT_HERSHEY_DUPLEX,
+                    1.0*sc, txt_color_bg, 2, cv2.LINE_AA)
+        cv2.putText(out, t, (int(8*sc), Ht*(i+1)), cv2.FONT_HERSHEY_DUPLEX,
+                    1.0*sc, txt_color_fg, 1, cv2.LINE_AA)
+
+    if path is not None:
+        cv2.imwrite(str(path), out)
+
+    return out
+
+def process_image_pair(image1_path, image2_path, matching, device):
+    image1 = cv2.imread(str(image1_path), cv2.IMREAD_GRAYSCALE)
+    image2 = cv2.imread(str(image2_path), cv2.IMREAD_GRAYSCALE)
+    
+    tensor1 = frame2tensor(image1, device=device)
+    tensor2 = frame2tensor(image2, device=device)
+
+    with torch.no_grad():
+        pred = matching({'image0': tensor1, 'image1': tensor2})
+    
+    pred = {k: v[0].detach().cpu().numpy() for k, v in pred.items()}
+    kpts0, kpts1 = pred['keypoints0'], pred['keypoints1']
+    matches, conf = pred['matches0'], pred['matching_scores0']
+
+    valid = matches > -1
+    mkpts0 = kpts0[valid]
+    mkpts1 = kpts1[matches[valid]]
+    
+    color = cm.jet(conf[valid])
+    text = [
+        'SuperGlue',
+        f'Matches: {len(mkpts0)}'
+    ]
+    
+    plot = make_matching_plot_fast(
+        image1, image2, kpts0, kpts1, mkpts0, mkpts1, color, text,
+        path=None, show_keypoints=True, keypoint_size=5)
+    
+    return plot
+
+def visualize_superglue(base_path, output_path, config):
+    camera_data_path = base_path / 'cam0/data'
+    output_path = Path(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    image_paths = sorted(camera_data_path.glob("*.png"))
+    matching, device = load_superglue_model(config)
+
+    frame_interval = config['superglue_visualization']['frame_interval']
+    max_pairs = config['superglue_visualization']['max_pairs']
+
+    for i in range(0, min(len(image_paths) - frame_interval, max_pairs * frame_interval), frame_interval):
+        plot = process_image_pair(image_paths[i], image_paths[i + frame_interval], matching, device)
+        
+        fig, ax = plt.subplots(figsize=(20, 10))
+        ax.imshow(plot)
+        ax.axis('off')
+        
+        plt.savefig(output_path / f'superglue_match_{i:04d}.png', bbox_inches='tight', pad_inches=0, dpi=300)
+        plt.close(fig)
+
+    print(f"SuperGlue visualizations saved to {output_path}")
+
+def load_superglue_model(config):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    superglue_config = {
+        'superpoint': {
+            'nms_radius': config['superglue']['nms_radius'],
+            'keypoint_threshold': config['superglue']['keypoint_threshold'],
+            'max_keypoints': config['superglue']['max_keypoints']
+        },
+        'superglue': {
+            'weights': config['superglue']['weights'],
+            'sinkhorn_iterations': config['superglue']['sinkhorn_iterations'],
+            'match_threshold': config['superglue']['match_threshold'],
+        }
+    }
+    matching = Matching(superglue_config).eval().to(device)
+    return matching, device
+
+########################################
+
+# matching.py içeriği:
+
+# %BANNER_BEGIN%
+# ---------------------------------------------------------------------
+# %COPYRIGHT_BEGIN%
+#
+#  Magic Leap, Inc. ("COMPANY") CONFIDENTIAL
+#
+#  Unpublished Copyright (c) 2020
+#  Magic Leap, Inc., All Rights Reserved.
+#
+# NOTICE:  All information contained herein is, and remains the property
+# of COMPANY. The intellectual and technical concepts contained herein
+# are proprietary to COMPANY and may be covered by U.S. and Foreign
+# Patents, patents in process, and are protected by trade secret or
+# copyright law.  Dissemination of this information or reproduction of
+# this material is strictly forbidden unless prior written permission is
+# obtained from COMPANY.  Access to the source code contained herein is
+# hereby forbidden to anyone except current COMPANY employees, managers
+# or contractors who have executed Confidentiality and Non-disclosure
+# agreements explicitly covering such access.
+#
+# The copyright notice above does not evidence any actual or intended
+# publication or disclosure  of  this source code, which includes
+# information that is confidential and/or proprietary, and is a trade
+# secret, of  COMPANY.   ANY REPRODUCTION, MODIFICATION, DISTRIBUTION,
+# PUBLIC  PERFORMANCE, OR PUBLIC DISPLAY OF OR THROUGH USE  OF THIS
+# SOURCE CODE  WITHOUT THE EXPRESS WRITTEN CONSENT OF COMPANY IS
+# STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE LAWS AND
+# INTERNATIONAL TREATIES.  THE RECEIPT OR POSSESSION OF  THIS SOURCE
+# CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS
+# TO REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE,
+# USE, OR SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
+#
+# %COPYRIGHT_END%
+# ----------------------------------------------------------------------
+# %AUTHORS_BEGIN%
+#
+#  Originating Authors: Paul-Edouard Sarlin
+#
+# %AUTHORS_END%
+# --------------------------------------------------------------------*/
+# %BANNER_END%
+
+import torch
+
+from .superpoint import SuperPoint
+from .superglue import SuperGlue
+
+
+class Matching(torch.nn.Module):
+    """ Image Matching Frontend (SuperPoint + SuperGlue) """
+    def __init__(self, config={}):
+        super().__init__()
+        self.superpoint = SuperPoint(config.get('superpoint', {}))
+        self.superglue = SuperGlue(config.get('superglue', {}))
+
+    def forward(self, data):
+        """ Run SuperPoint (optionally) and SuperGlue
+        SuperPoint is skipped if ['keypoints0', 'keypoints1'] exist in input
+        Args:
+          data: dictionary with minimal keys: ['image0', 'image1']
+        """
+        pred = {}
+
+        # Extract SuperPoint (keypoints, scores, descriptors) if not provided
+        if 'keypoints0' not in data:
+            pred0 = self.superpoint({'image': data['image0']})
+            pred = {**pred, **{k+'0': v for k, v in pred0.items()}}
+        if 'keypoints1' not in data:
+            pred1 = self.superpoint({'image': data['image1']})
+            pred = {**pred, **{k+'1': v for k, v in pred1.items()}}
+
+        # Batch all features
+        # We should either have i) one image per batch, or
+        # ii) the same number of local features for all images in the batch.
+        data = {**data, **pred}
+
+        for k in data:
+            if isinstance(data[k], (list, tuple)):
+                data[k] = torch.stack(data[k])
+
+        # Perform the matching
+        pred = {**pred, **self.superglue(data)}
+
+        return pred
+
+
+########################################
+
+# superglue.py içeriği:
+
+# %BANNER_BEGIN%
+# ---------------------------------------------------------------------
+# %COPYRIGHT_BEGIN%
+#
+#  Magic Leap, Inc. ("COMPANY") CONFIDENTIAL
+#
+#  Unpublished Copyright (c) 2020
+#  Magic Leap, Inc., All Rights Reserved.
+#
+# NOTICE:  All information contained herein is, and remains the property
+# of COMPANY. The intellectual and technical concepts contained herein
+# are proprietary to COMPANY and may be covered by U.S. and Foreign
+# Patents, patents in process, and are protected by trade secret or
+# copyright law.  Dissemination of this information or reproduction of
+# this material is strictly forbidden unless prior written permission is
+# obtained from COMPANY.  Access to the source code contained herein is
+# hereby forbidden to anyone except current COMPANY employees, managers
+# or contractors who have executed Confidentiality and Non-disclosure
+# agreements explicitly covering such access.
+#
+# The copyright notice above does not evidence any actual or intended
+# publication or disclosure  of  this source code, which includes
+# information that is confidential and/or proprietary, and is a trade
+# secret, of  COMPANY.   ANY REPRODUCTION, MODIFICATION, DISTRIBUTION,
+# PUBLIC  PERFORMANCE, OR PUBLIC DISPLAY OF OR THROUGH USE  OF THIS
+# SOURCE CODE  WITHOUT THE EXPRESS WRITTEN CONSENT OF COMPANY IS
+# STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE LAWS AND
+# INTERNATIONAL TREATIES.  THE RECEIPT OR POSSESSION OF  THIS SOURCE
+# CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS
+# TO REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE,
+# USE, OR SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
+#
+# %COPYRIGHT_END%
+# ----------------------------------------------------------------------
+# %AUTHORS_BEGIN%
+#
+#  Originating Authors: Paul-Edouard Sarlin
+#
+# %AUTHORS_END%
+# --------------------------------------------------------------------*/
+# %BANNER_END%
+
+from copy import deepcopy
+from pathlib import Path
+from typing import List, Tuple
+
+import torch
+from torch import nn
+
+
+def MLP(channels: List[int], do_bn: bool = True) -> nn.Module:
+    """ Multi-layer perceptron """
+    n = len(channels)
+    layers = []
+    for i in range(1, n):
+        layers.append(
+            nn.Conv1d(channels[i - 1], channels[i], kernel_size=1, bias=True))
+        if i < (n-1):
+            if do_bn:
+                layers.append(nn.BatchNorm1d(channels[i]))
+            layers.append(nn.ReLU())
+    return nn.Sequential(*layers)
+
+
+def normalize_keypoints(kpts, image_shape):
+    """ Normalize keypoints locations based on image image_shape"""
+    _, _, height, width = image_shape
+    one = kpts.new_tensor(1)
+    size = torch.stack([one*width, one*height])[None]
+    center = size / 2
+    scaling = size.max(1, keepdim=True).values * 0.7
+    return (kpts - center[:, None, :]) / scaling[:, None, :]
+
+
+class KeypointEncoder(nn.Module):
+    """ Joint encoding of visual appearance and location using MLPs"""
+    def __init__(self, feature_dim: int, layers: List[int]) -> None:
+        super().__init__()
+        self.encoder = MLP([3] + layers + [feature_dim])
+        nn.init.constant_(self.encoder[-1].bias, 0.0)
+
+    def forward(self, kpts, scores):
+        inputs = [kpts.transpose(1, 2), scores.unsqueeze(1)]
+        return self.encoder(torch.cat(inputs, dim=1))
+
+
+def attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> Tuple[torch.Tensor,torch.Tensor]:
+    dim = query.shape[1]
+    scores = torch.einsum('bdhn,bdhm->bhnm', query, key) / dim**.5
+    prob = torch.nn.functional.softmax(scores, dim=-1)
+    return torch.einsum('bhnm,bdhm->bdhn', prob, value), prob
+
+
+class MultiHeadedAttention(nn.Module):
+    """ Multi-head attention to increase model expressivitiy """
+    def __init__(self, num_heads: int, d_model: int):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.dim = d_model // num_heads
+        self.num_heads = num_heads
+        self.merge = nn.Conv1d(d_model, d_model, kernel_size=1)
+        self.proj = nn.ModuleList([deepcopy(self.merge) for _ in range(3)])
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        batch_dim = query.size(0)
+        query, key, value = [l(x).view(batch_dim, self.dim, self.num_heads, -1)
+                             for l, x in zip(self.proj, (query, key, value))]
+        x, _ = attention(query, key, value)
+        return self.merge(x.contiguous().view(batch_dim, self.dim*self.num_heads, -1))
+
+
+class AttentionalPropagation(nn.Module):
+    def __init__(self, feature_dim: int, num_heads: int):
+        super().__init__()
+        self.attn = MultiHeadedAttention(num_heads, feature_dim)
+        self.mlp = MLP([feature_dim*2, feature_dim*2, feature_dim])
+        nn.init.constant_(self.mlp[-1].bias, 0.0)
+
+    def forward(self, x: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+        message = self.attn(x, source, source)
+        return self.mlp(torch.cat([x, message], dim=1))
+
+
+class AttentionalGNN(nn.Module):
+    def __init__(self, feature_dim: int, layer_names: List[str]) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([
+            AttentionalPropagation(feature_dim, 4)
+            for _ in range(len(layer_names))])
+        self.names = layer_names
+
+    def forward(self, desc0: torch.Tensor, desc1: torch.Tensor) -> Tuple[torch.Tensor,torch.Tensor]:
+        for layer, name in zip(self.layers, self.names):
+            if name == 'cross':
+                src0, src1 = desc1, desc0
+            else:  # if name == 'self':
+                src0, src1 = desc0, desc1
+            delta0, delta1 = layer(desc0, src0), layer(desc1, src1)
+            desc0, desc1 = (desc0 + delta0), (desc1 + delta1)
+        return desc0, desc1
+
+
+def log_sinkhorn_iterations(Z: torch.Tensor, log_mu: torch.Tensor, log_nu: torch.Tensor, iters: int) -> torch.Tensor:
+    """ Perform Sinkhorn Normalization in Log-space for stability"""
+    u, v = torch.zeros_like(log_mu), torch.zeros_like(log_nu)
+    for _ in range(iters):
+        u = log_mu - torch.logsumexp(Z + v.unsqueeze(1), dim=2)
+        v = log_nu - torch.logsumexp(Z + u.unsqueeze(2), dim=1)
+    return Z + u.unsqueeze(2) + v.unsqueeze(1)
+
+
+def log_optimal_transport(scores: torch.Tensor, alpha: torch.Tensor, iters: int) -> torch.Tensor:
+    """ Perform Differentiable Optimal Transport in Log-space for stability"""
+    b, m, n = scores.shape
+    one = scores.new_tensor(1)
+    ms, ns = (m*one).to(scores), (n*one).to(scores)
+
+    bins0 = alpha.expand(b, m, 1)
+    bins1 = alpha.expand(b, 1, n)
+    alpha = alpha.expand(b, 1, 1)
+
+    couplings = torch.cat([torch.cat([scores, bins0], -1),
+                           torch.cat([bins1, alpha], -1)], 1)
+
+    norm = - (ms + ns).log()
+    log_mu = torch.cat([norm.expand(m), ns.log()[None] + norm])
+    log_nu = torch.cat([norm.expand(n), ms.log()[None] + norm])
+    log_mu, log_nu = log_mu[None].expand(b, -1), log_nu[None].expand(b, -1)
+
+    Z = log_sinkhorn_iterations(couplings, log_mu, log_nu, iters)
+    Z = Z - norm  # multiply probabilities by M+N
+    return Z
+
+
+def arange_like(x, dim: int):
+    return x.new_ones(x.shape[dim]).cumsum(0) - 1  # traceable in 1.1
+
+
+class SuperGlue(nn.Module):
+    """SuperGlue feature matching middle-end
+
+    Given two sets of keypoints and locations, we determine the
+    correspondences by:
+      1. Keypoint Encoding (normalization + visual feature and location fusion)
+      2. Graph Neural Network with multiple self and cross-attention layers
+      3. Final projection layer
+      4. Optimal Transport Layer (a differentiable Hungarian matching algorithm)
+      5. Thresholding matrix based on mutual exclusivity and a match_threshold
+
+    The correspondence ids use -1 to indicate non-matching points.
+
+    Paul-Edouard Sarlin, Daniel DeTone, Tomasz Malisiewicz, and Andrew
+    Rabinovich. SuperGlue: Learning Feature Matching with Graph Neural
+    Networks. In CVPR, 2020. https://arxiv.org/abs/1911.11763
+
+    """
+    default_config = {
+        'descriptor_dim': 256,
+        'weights': 'indoor',
+        'keypoint_encoder': [32, 64, 128, 256],
+        'GNN_layers': ['self', 'cross'] * 9,
+        'sinkhorn_iterations': 100,
+        'match_threshold': 0.2,
+    }
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = {**self.default_config, **config}
+
+        self.kenc = KeypointEncoder(
+            self.config['descriptor_dim'], self.config['keypoint_encoder'])
+
+        self.gnn = AttentionalGNN(
+            feature_dim=self.config['descriptor_dim'], layer_names=self.config['GNN_layers'])
+
+        self.final_proj = nn.Conv1d(
+            self.config['descriptor_dim'], self.config['descriptor_dim'],
+            kernel_size=1, bias=True)
+
+        bin_score = torch.nn.Parameter(torch.tensor(1.))
+        self.register_parameter('bin_score', bin_score)
+
+        assert self.config['weights'] in ['indoor', 'outdoor']
+        path = Path(__file__).parent
+        path = path / 'weights/superglue_{}.pth'.format(self.config['weights'])
+        self.load_state_dict(torch.load(str(path), weights_only=True))
+        print('Loaded SuperGlue model (\"{}\" weights)'.format(
+            self.config['weights']))
+
+    def forward(self, data):
+        """Run SuperGlue on a pair of keypoints and descriptors"""
+        desc0, desc1 = data['descriptors0'], data['descriptors1']
+        kpts0, kpts1 = data['keypoints0'], data['keypoints1']
+
+        if kpts0.shape[1] == 0 or kpts1.shape[1] == 0:  # no keypoints
+            shape0, shape1 = kpts0.shape[:-1], kpts1.shape[:-1]
+            return {
+                'matches0': kpts0.new_full(shape0, -1, dtype=torch.int),
+                'matches1': kpts1.new_full(shape1, -1, dtype=torch.int),
+                'matching_scores0': kpts0.new_zeros(shape0),
+                'matching_scores1': kpts1.new_zeros(shape1),
+            }
+
+        # Keypoint normalization.
+        kpts0 = normalize_keypoints(kpts0, data['image0'].shape)
+        kpts1 = normalize_keypoints(kpts1, data['image1'].shape)
+
+        # Keypoint MLP encoder.
+        desc0 = desc0 + self.kenc(kpts0, data['scores0'])
+        desc1 = desc1 + self.kenc(kpts1, data['scores1'])
+
+        # Multi-layer Transformer network.
+        desc0, desc1 = self.gnn(desc0, desc1)
+
+        # Final MLP projection.
+        mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
+
+        # Compute matching descriptor distance.
+        scores = torch.einsum('bdn,bdm->bnm', mdesc0, mdesc1)
+        scores = scores / self.config['descriptor_dim']**.5
+
+        # Run the optimal transport.
+        scores = log_optimal_transport(
+            scores, self.bin_score,
+            iters=self.config['sinkhorn_iterations'])
+
+        # Get the matches with score above "match_threshold".
+        max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
+        indices0, indices1 = max0.indices, max1.indices
+        mutual0 = arange_like(indices0, 1)[None] == indices1.gather(1, indices0)
+        mutual1 = arange_like(indices1, 1)[None] == indices0.gather(1, indices1)
+        zero = scores.new_tensor(0)
+        mscores0 = torch.where(mutual0, max0.values.exp(), zero)
+        mscores1 = torch.where(mutual1, mscores0.gather(1, indices1), zero)
+        valid0 = mutual0 & (mscores0 > self.config['match_threshold'])
+        valid1 = mutual1 & valid0.gather(1, indices1)
+        indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
+        indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
+
+        return {
+            'matches0': indices0, # use -1 for invalid match
+            'matches1': indices1, # use -1 for invalid match
+            'matching_scores0': mscores0,
+            'matching_scores1': mscores1,
+        }
+
+
+########################################
+
+# superpoint.py içeriği:
+
+# %BANNER_BEGIN%
+# ---------------------------------------------------------------------
+# %COPYRIGHT_BEGIN%
+#
+#  Magic Leap, Inc. ("COMPANY") CONFIDENTIAL
+#
+#  Unpublished Copyright (c) 2020
+#  Magic Leap, Inc., All Rights Reserved.
+#
+# NOTICE:  All information contained herein is, and remains the property
+# of COMPANY. The intellectual and technical concepts contained herein
+# are proprietary to COMPANY and may be covered by U.S. and Foreign
+# Patents, patents in process, and are protected by trade secret or
+# copyright law.  Dissemination of this information or reproduction of
+# this material is strictly forbidden unless prior written permission is
+# obtained from COMPANY.  Access to the source code contained herein is
+# hereby forbidden to anyone except current COMPANY employees, managers
+# or contractors who have executed Confidentiality and Non-disclosure
+# agreements explicitly covering such access.
+#
+# The copyright notice above does not evidence any actual or intended
+# publication or disclosure  of  this source code, which includes
+# information that is confidential and/or proprietary, and is a trade
+# secret, of  COMPANY.   ANY REPRODUCTION, MODIFICATION, DISTRIBUTION,
+# PUBLIC  PERFORMANCE, OR PUBLIC DISPLAY OF OR THROUGH USE  OF THIS
+# SOURCE CODE  WITHOUT THE EXPRESS WRITTEN CONSENT OF COMPANY IS
+# STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE LAWS AND
+# INTERNATIONAL TREATIES.  THE RECEIPT OR POSSESSION OF  THIS SOURCE
+# CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS
+# TO REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE,
+# USE, OR SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
+#
+# %COPYRIGHT_END%
+# ----------------------------------------------------------------------
+# %AUTHORS_BEGIN%
+#
+#  Originating Authors: Paul-Edouard Sarlin
+#
+# %AUTHORS_END%
+# --------------------------------------------------------------------*/
+# %BANNER_END%
+
+from pathlib import Path
+import torch
+from torch import nn
+
+def simple_nms(scores, nms_radius: int):
+    """ Fast Non-maximum suppression to remove nearby points """
+    assert(nms_radius >= 0)
+
+    def max_pool(x):
+        return torch.nn.functional.max_pool2d(
+            x, kernel_size=nms_radius*2+1, stride=1, padding=nms_radius)
+
+    zeros = torch.zeros_like(scores)
+    max_mask = scores == max_pool(scores)
+    for _ in range(2):
+        supp_mask = max_pool(max_mask.float()) > 0
+        supp_scores = torch.where(supp_mask, zeros, scores)
+        new_max_mask = supp_scores == max_pool(supp_scores)
+        max_mask = max_mask | (new_max_mask & (~supp_mask))
+    return torch.where(max_mask, scores, zeros)
+
+
+def remove_borders(keypoints, scores, border: int, height: int, width: int):
+    """ Removes keypoints too close to the border """
+    mask_h = (keypoints[:, 0] >= border) & (keypoints[:, 0] < (height - border))
+    mask_w = (keypoints[:, 1] >= border) & (keypoints[:, 1] < (width - border))
+    mask = mask_h & mask_w
+    return keypoints[mask], scores[mask]
+
+
+def top_k_keypoints(keypoints, scores, k: int):
+    if k >= len(keypoints):
+        return keypoints, scores
+    scores, indices = torch.topk(scores, k, dim=0)
+    return keypoints[indices], scores
+
+
+def sample_descriptors(keypoints, descriptors, s: int = 8):
+    """ Interpolate descriptors at keypoint locations """
+    b, c, h, w = descriptors.shape
+    keypoints = keypoints - s / 2 + 0.5
+    keypoints /= torch.tensor([(w*s - s/2 - 0.5), (h*s - s/2 - 0.5)],
+                              ).to(keypoints)[None]
+    keypoints = keypoints*2 - 1  # normalize to (-1, 1)
+    args = {'align_corners': True} if torch.__version__ >= '1.3' else {}
+    descriptors = torch.nn.functional.grid_sample(
+        descriptors, keypoints.view(b, 1, -1, 2), mode='bilinear', **args)
+    descriptors = torch.nn.functional.normalize(
+        descriptors.reshape(b, c, -1), p=2, dim=1)
+    return descriptors
+
+
+class SuperPoint(nn.Module):
+    """SuperPoint Convolutional Detector and Descriptor
+
+    SuperPoint: Self-Supervised Interest Point Detection and
+    Description. Daniel DeTone, Tomasz Malisiewicz, and Andrew
+    Rabinovich. In CVPRW, 2019. https://arxiv.org/abs/1712.07629
+
+    """
+    default_config = {
+        'descriptor_dim': 256,
+        'nms_radius': 4,
+        'keypoint_threshold': 0.005,
+        'max_keypoints': -1,
+        'remove_borders': 4,
+    }
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = {**self.default_config, **config}
+
+        self.relu = nn.ReLU(inplace=True)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        c1, c2, c3, c4, c5 = 64, 64, 128, 128, 256
+
+        self.conv1a = nn.Conv2d(1, c1, kernel_size=3, stride=1, padding=1)
+        self.conv1b = nn.Conv2d(c1, c1, kernel_size=3, stride=1, padding=1)
+        self.conv2a = nn.Conv2d(c1, c2, kernel_size=3, stride=1, padding=1)
+        self.conv2b = nn.Conv2d(c2, c2, kernel_size=3, stride=1, padding=1)
+        self.conv3a = nn.Conv2d(c2, c3, kernel_size=3, stride=1, padding=1)
+        self.conv3b = nn.Conv2d(c3, c3, kernel_size=3, stride=1, padding=1)
+        self.conv4a = nn.Conv2d(c3, c4, kernel_size=3, stride=1, padding=1)
+        self.conv4b = nn.Conv2d(c4, c4, kernel_size=3, stride=1, padding=1)
+
+        self.convPa = nn.Conv2d(c4, c5, kernel_size=3, stride=1, padding=1)
+        self.convPb = nn.Conv2d(c5, 65, kernel_size=1, stride=1, padding=0)
+
+        self.convDa = nn.Conv2d(c4, c5, kernel_size=3, stride=1, padding=1)
+        self.convDb = nn.Conv2d(
+            c5, self.config['descriptor_dim'],
+            kernel_size=1, stride=1, padding=0)
+
+        path = Path(__file__).parent / 'weights/superpoint_v1.pth'
+        self.load_state_dict(torch.load(str(path), weights_only=True))
+
+        mk = self.config['max_keypoints']
+        if mk == 0 or mk < -1:
+            raise ValueError('\"max_keypoints\" must be positive or \"-1\"')
+
+        print('Loaded SuperPoint model')
+
+    def forward(self, data):
+        """ Compute keypoints, scores, descriptors for image """
+        # Shared Encoder
+        x = self.relu(self.conv1a(data['image']))
+        x = self.relu(self.conv1b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv2a(x))
+        x = self.relu(self.conv2b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv3a(x))
+        x = self.relu(self.conv3b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv4a(x))
+        x = self.relu(self.conv4b(x))
+
+        # Compute the dense keypoint scores
+        cPa = self.relu(self.convPa(x))
+        scores = self.convPb(cPa)
+        scores = torch.nn.functional.softmax(scores, 1)[:, :-1]
+        b, _, h, w = scores.shape
+        scores = scores.permute(0, 2, 3, 1).reshape(b, h, w, 8, 8)
+        scores = scores.permute(0, 1, 3, 2, 4).reshape(b, h*8, w*8)
+        scores = simple_nms(scores, self.config['nms_radius'])
+
+        # Extract keypoints
+        keypoints = [
+            torch.nonzero(s > self.config['keypoint_threshold'])
+            for s in scores]
+        scores = [s[tuple(k.t())] for s, k in zip(scores, keypoints)]
+
+        # Discard keypoints near the image borders
+        keypoints, scores = list(zip(*[
+            remove_borders(k, s, self.config['remove_borders'], h*8, w*8)
+            for k, s in zip(keypoints, scores)]))
+
+        # Keep the k keypoints with highest score
+        if self.config['max_keypoints'] >= 0:
+            keypoints, scores = list(zip(*[
+                top_k_keypoints(k, s, self.config['max_keypoints'])
+                for k, s in zip(keypoints, scores)]))
+
+        # Convert (h, w) to (x, y)
+        keypoints = [torch.flip(k, [1]).float() for k in keypoints]
+
+        # Compute the dense descriptors
+        cDa = self.relu(self.convDa(x))
+        descriptors = self.convDb(cDa)
+        descriptors = torch.nn.functional.normalize(descriptors, p=2, dim=1)
+
+        # Extract descriptors
+        descriptors = [sample_descriptors(k[None], d[None], 8)[0]
+                       for k, d in zip(keypoints, descriptors)]
+
+        return {
+            'keypoints': keypoints,
+            'scores': scores,
+            'descriptors': descriptors,
+        }
+
+
+########################################
+
+# utils.py içeriği:
+
+# %BANNER_BEGIN%
+# ---------------------------------------------------------------------
+# %COPYRIGHT_BEGIN%
+#
+#  Magic Leap, Inc. ("COMPANY") CONFIDENTIAL
+#
+#  Unpublished Copyright (c) 2020
+#  Magic Leap, Inc., All Rights Reserved.
+#
+# NOTICE:  All information contained herein is, and remains the property
+# of COMPANY. The intellectual and technical concepts contained herein
+# are proprietary to COMPANY and may be covered by U.S. and Foreign
+# Patents, patents in process, and are protected by trade secret or
+# copyright law.  Dissemination of this information or reproduction of
+# this material is strictly forbidden unless prior written permission is
+# obtained from COMPANY.  Access to the source code contained herein is
+# hereby forbidden to anyone except current COMPANY employees, managers
+# or contractors who have executed Confidentiality and Non-disclosure
+# agreements explicitly covering such access.
+#
+# The copyright notice above does not evidence any actual or intended
+# publication or disclosure  of  this source code, which includes
+# information that is confidential and/or proprietary, and is a trade
+# secret, of  COMPANY.   ANY REPRODUCTION, MODIFICATION, DISTRIBUTION,
+# PUBLIC  PERFORMANCE, OR PUBLIC DISPLAY OF OR THROUGH USE  OF THIS
+# SOURCE CODE  WITHOUT THE EXPRESS WRITTEN CONSENT OF COMPANY IS
+# STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE LAWS AND
+# INTERNATIONAL TREATIES.  THE RECEIPT OR POSSESSION OF  THIS SOURCE
+# CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS
+# TO REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE,
+# USE, OR SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
+#
+# %COPYRIGHT_END%
+# ----------------------------------------------------------------------
+# %AUTHORS_BEGIN%
+#
+#  Originating Authors: Paul-Edouard Sarlin
+#                       Daniel DeTone
+#                       Tomasz Malisiewicz
+#
+# %AUTHORS_END%
+# --------------------------------------------------------------------*/
+# %BANNER_END%
+
+from pathlib import Path
+import time
+from collections import OrderedDict
+from threading import Thread
+import numpy as np
+import cv2
+import torch
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')
+
+
+class AverageTimer:
+    """ Class to help manage printing simple timing of code execution. """
+
+    def __init__(self, smoothing=0.3, newline=False):
+        self.smoothing = smoothing
+        self.newline = newline
+        self.times = OrderedDict()
+        self.will_print = OrderedDict()
+        self.reset()
+
+    def reset(self):
+        now = time.time()
+        self.start = now
+        self.last_time = now
+        for name in self.will_print:
+            self.will_print[name] = False
+
+    def update(self, name='default'):
+        now = time.time()
+        dt = now - self.last_time
+        if name in self.times:
+            dt = self.smoothing * dt + (1 - self.smoothing) * self.times[name]
+        self.times[name] = dt
+        self.will_print[name] = True
+        self.last_time = now
+
+    def print(self, text='Timer'):
+        total = 0.
+        print('[{}]'.format(text), end=' ')
+        for key in self.times:
+            val = self.times[key]
+            if self.will_print[key]:
+                print('%s=%.3f' % (key, val), end=' ')
+                total += val
+        print('total=%.3f sec {%.1f FPS}' % (total, 1./total), end=' ')
+        if self.newline:
+            print(flush=True)
+        else:
+            print(end='\r', flush=True)
+        self.reset()
+
+
+class VideoStreamer:
+    """ Class to help process image streams. Four types of possible inputs:"
+        1.) USB Webcam.
+        2.) An IP camera
+        3.) A directory of images (files in directory matching 'image_glob').
+        4.) A video file, such as an .mp4 or .avi file.
+    """
+    def __init__(self, basedir, resize, skip, image_glob, max_length=1000000):
+        self._ip_grabbed = False
+        self._ip_running = False
+        self._ip_camera = False
+        self._ip_image = None
+        self._ip_index = 0
+        self.cap = []
+        self.camera = True
+        self.video_file = False
+        self.listing = []
+        self.resize = resize
+        self.interp = cv2.INTER_AREA
+        self.i = 0
+        self.skip = skip
+        self.max_length = max_length
+        if isinstance(basedir, int) or basedir.isdigit():
+            print('==> Processing USB webcam input: {}'.format(basedir))
+            self.cap = cv2.VideoCapture(int(basedir))
+            self.listing = range(0, self.max_length)
+        elif basedir.startswith(('http', 'rtsp')):
+            print('==> Processing IP camera input: {}'.format(basedir))
+            self.cap = cv2.VideoCapture(basedir)
+            self.start_ip_camera_thread()
+            self._ip_camera = True
+            self.listing = range(0, self.max_length)
+        elif Path(basedir).is_dir():
+            print('==> Processing image directory input: {}'.format(basedir))
+            self.listing = list(Path(basedir).glob(image_glob[0]))
+            for j in range(1, len(image_glob)):
+                image_path = list(Path(basedir).glob(image_glob[j]))
+                self.listing = self.listing + image_path
+            self.listing.sort()
+            self.listing = self.listing[::self.skip]
+            self.max_length = np.min([self.max_length, len(self.listing)])
+            if self.max_length == 0:
+                raise IOError('No images found (maybe bad \'image_glob\' ?)')
+            self.listing = self.listing[:self.max_length]
+            self.camera = False
+        elif Path(basedir).exists():
+            print('==> Processing video input: {}'.format(basedir))
+            self.cap = cv2.VideoCapture(basedir)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            num_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.listing = range(0, num_frames)
+            self.listing = self.listing[::self.skip]
+            self.video_file = True
+            self.max_length = np.min([self.max_length, len(self.listing)])
+            self.listing = self.listing[:self.max_length]
+        else:
+            raise ValueError('VideoStreamer input \"{}\" not recognized.'.format(basedir))
+        if self.camera and not self.cap.isOpened():
+            raise IOError('Could not read camera')
+
+    def load_image(self, impath):
+        """ Read image as grayscale and resize to img_size.
+        Inputs
+            impath: Path to input image.
+        Returns
+            grayim: uint8 numpy array sized H x W.
+        """
+        grayim = cv2.imread(impath, 0)
+        if grayim is None:
+            raise Exception('Error reading image %s' % impath)
+        w, h = grayim.shape[1], grayim.shape[0]
+        w_new, h_new = process_resize(w, h, self.resize)
+        grayim = cv2.resize(
+            grayim, (w_new, h_new), interpolation=self.interp)
+        return grayim
+
+    def next_frame(self):
+        """ Return the next frame, and increment internal counter.
+        Returns
+             image: Next H x W image.
+             status: True or False depending whether image was loaded.
+        """
+
+        if self.i == self.max_length:
+            return (None, False)
+        if self.camera:
+
+            if self._ip_camera:
+                #Wait for first image, making sure we haven't exited
+                while self._ip_grabbed is False and self._ip_exited is False:
+                    time.sleep(.001)
+
+                ret, image = self._ip_grabbed, self._ip_image.copy()
+                if ret is False:
+                    self._ip_running = False
+            else:
+                ret, image = self.cap.read()
+            if ret is False:
+                print('VideoStreamer: Cannot get image from camera')
+                return (None, False)
+            w, h = image.shape[1], image.shape[0]
+            if self.video_file:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.listing[self.i])
+
+            w_new, h_new = process_resize(w, h, self.resize)
+            image = cv2.resize(image, (w_new, h_new),
+                               interpolation=self.interp)
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        else:
+            image_file = str(self.listing[self.i])
+            image = self.load_image(image_file)
+        self.i = self.i + 1
+        return (image, True)
+
+    def start_ip_camera_thread(self):
+        self._ip_thread = Thread(target=self.update_ip_camera, args=())
+        self._ip_running = True
+        self._ip_thread.start()
+        self._ip_exited = False
+        return self
+
+    def update_ip_camera(self):
+        while self._ip_running:
+            ret, img = self.cap.read()
+            if ret is False:
+                self._ip_running = False
+                self._ip_exited = True
+                self._ip_grabbed = False
+                return
+
+            self._ip_image = img
+            self._ip_grabbed = ret
+            self._ip_index += 1
+            #print('IPCAMERA THREAD got frame {}'.format(self._ip_index))
+
+
+    def cleanup(self):
+        self._ip_running = False
+
+# --- PREPROCESSING ---
+
+def process_resize(w, h, resize):
+    assert(len(resize) > 0 and len(resize) <= 2)
+    if len(resize) == 1 and resize[0] > -1:
+        scale = resize[0] / max(h, w)
+        w_new, h_new = int(round(w*scale)), int(round(h*scale))
+    elif len(resize) == 1 and resize[0] == -1:
+        w_new, h_new = w, h
+    else:  # len(resize) == 2:
+        w_new, h_new = resize[0], resize[1]
+
+    # Issue warning if resolution is too small or too large.
+    if max(w_new, h_new) < 160:
+        print('Warning: input resolution is very small, results may vary')
+    elif max(w_new, h_new) > 2000:
+        print('Warning: input resolution is very large, results may vary')
+
+    return w_new, h_new
+
+
+def frame2tensor(frame, device):
+    return torch.from_numpy(frame/255.).float()[None, None].to(device)
+
+
+def read_image(path, device, resize, rotation, resize_float):
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        return None, None, None
+    w, h = image.shape[1], image.shape[0]
+    w_new, h_new = process_resize(w, h, resize)
+    scales = (float(w) / float(w_new), float(h) / float(h_new))
+
+    if resize_float:
+        image = cv2.resize(image.astype('float32'), (w_new, h_new))
+    else:
+        image = cv2.resize(image, (w_new, h_new)).astype('float32')
+
+    if rotation != 0:
+        image = np.rot90(image, k=rotation)
+        if rotation % 2:
+            scales = scales[::-1]
+
+    inp = frame2tensor(image, device)
+    return image, inp, scales
+
+
+# --- GEOMETRY ---
+
+
+def estimate_pose(kpts0, kpts1, K0, K1, thresh, conf=0.99999):
+    if len(kpts0) < 5:
+        return None
+
+    f_mean = np.mean([K0[0, 0], K1[1, 1], K0[0, 0], K1[1, 1]])
+    norm_thresh = thresh / f_mean
+
+    kpts0 = (kpts0 - K0[[0, 1], [2, 2]][None]) / K0[[0, 1], [0, 1]][None]
+    kpts1 = (kpts1 - K1[[0, 1], [2, 2]][None]) / K1[[0, 1], [0, 1]][None]
+
+    E, mask = cv2.findEssentialMat(
+        kpts0, kpts1, np.eye(3), threshold=norm_thresh, prob=conf,
+        method=cv2.RANSAC)
+
+    assert E is not None
+
+    best_num_inliers = 0
+    ret = None
+    for _E in np.split(E, len(E) / 3):
+        n, R, t, _ = cv2.recoverPose(
+            _E, kpts0, kpts1, np.eye(3), 1e9, mask=mask)
+        if n > best_num_inliers:
+            best_num_inliers = n
+            ret = (R, t[:, 0], mask.ravel() > 0)
+    return ret
+
+
+def rotate_intrinsics(K, image_shape, rot):
+    """image_shape is the shape of the image after rotation"""
+    assert rot <= 3
+    h, w = image_shape[:2][::-1 if (rot % 2) else 1]
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    rot = rot % 4
+    if rot == 1:
+        return np.array([[fy, 0., cy],
+                         [0., fx, w-1-cx],
+                         [0., 0., 1.]], dtype=K.dtype)
+    elif rot == 2:
+        return np.array([[fx, 0., w-1-cx],
+                         [0., fy, h-1-cy],
+                         [0., 0., 1.]], dtype=K.dtype)
+    else:  # if rot == 3:
+        return np.array([[fy, 0., h-1-cy],
+                         [0., fx, cx],
+                         [0., 0., 1.]], dtype=K.dtype)
+
+
+def rotate_pose_inplane(i_T_w, rot):
+    rotation_matrices = [
+        np.array([[np.cos(r), -np.sin(r), 0., 0.],
+                  [np.sin(r), np.cos(r), 0., 0.],
+                  [0., 0., 1., 0.],
+                  [0., 0., 0., 1.]], dtype=np.float32)
+        for r in [np.deg2rad(d) for d in (0, 270, 180, 90)]
+    ]
+    return np.dot(rotation_matrices[rot], i_T_w)
+
+
+def scale_intrinsics(K, scales):
+    scales = np.diag([1./scales[0], 1./scales[1], 1.])
+    return np.dot(scales, K)
+
+
+def to_homogeneous(points):
+    return np.concatenate([points, np.ones_like(points[:, :1])], axis=-1)
+
+
+def compute_epipolar_error(kpts0, kpts1, T_0to1, K0, K1):
+    kpts0 = (kpts0 - K0[[0, 1], [2, 2]][None]) / K0[[0, 1], [0, 1]][None]
+    kpts1 = (kpts1 - K1[[0, 1], [2, 2]][None]) / K1[[0, 1], [0, 1]][None]
+    kpts0 = to_homogeneous(kpts0)
+    kpts1 = to_homogeneous(kpts1)
+
+    t0, t1, t2 = T_0to1[:3, 3]
+    t_skew = np.array([
+        [0, -t2, t1],
+        [t2, 0, -t0],
+        [-t1, t0, 0]
+    ])
+    E = t_skew @ T_0to1[:3, :3]
+
+    Ep0 = kpts0 @ E.T  # N x 3
+    p1Ep0 = np.sum(kpts1 * Ep0, -1)  # N
+    Etp1 = kpts1 @ E  # N x 3
+    d = p1Ep0**2 * (1.0 / (Ep0[:, 0]**2 + Ep0[:, 1]**2)
+                    + 1.0 / (Etp1[:, 0]**2 + Etp1[:, 1]**2))
+    return d
+
+
+def angle_error_mat(R1, R2):
+    cos = (np.trace(np.dot(R1.T, R2)) - 1) / 2
+    cos = np.clip(cos, -1., 1.)  # numercial errors can make it out of bounds
+    return np.rad2deg(np.abs(np.arccos(cos)))
+
+
+def angle_error_vec(v1, v2):
+    n = np.linalg.norm(v1) * np.linalg.norm(v2)
+    return np.rad2deg(np.arccos(np.clip(np.dot(v1, v2) / n, -1.0, 1.0)))
+
+
+def compute_pose_error(T_0to1, R, t):
+    R_gt = T_0to1[:3, :3]
+    t_gt = T_0to1[:3, 3]
+    error_t = angle_error_vec(t, t_gt)
+    error_t = np.minimum(error_t, 180 - error_t)  # ambiguity of E estimation
+    error_R = angle_error_mat(R, R_gt)
+    return error_t, error_R
+
+
+def pose_auc(errors, thresholds):
+    sort_idx = np.argsort(errors)
+    errors = np.array(errors.copy())[sort_idx]
+    recall = (np.arange(len(errors)) + 1) / len(errors)
+    errors = np.r_[0., errors]
+    recall = np.r_[0., recall]
+    aucs = []
+    for t in thresholds:
+        last_index = np.searchsorted(errors, t)
+        r = np.r_[recall[:last_index], recall[last_index-1]]
+        e = np.r_[errors[:last_index], t]
+        aucs.append(np.trapz(r, x=e)/t)
+    return aucs
+
+
+# --- VISUALIZATION ---
+
+
+def plot_image_pair(imgs, dpi=100, size=6, pad=.5):
+    n = len(imgs)
+    assert n == 2, 'number of images must be two'
+    figsize = (size*n, size*3/4) if size is not None else None
+    _, ax = plt.subplots(1, n, figsize=figsize, dpi=dpi)
+    for i in range(n):
+        ax[i].imshow(imgs[i], cmap=plt.get_cmap('gray'), vmin=0, vmax=255)
+        ax[i].get_yaxis().set_ticks([])
+        ax[i].get_xaxis().set_ticks([])
+        for spine in ax[i].spines.values():  # remove frame
+            spine.set_visible(False)
+    plt.tight_layout(pad=pad)
+
+
+def plot_keypoints(kpts0, kpts1, color='w', ps=2):
+    ax = plt.gcf().axes
+    ax[0].scatter(kpts0[:, 0], kpts0[:, 1], c=color, s=ps)
+    ax[1].scatter(kpts1[:, 0], kpts1[:, 1], c=color, s=ps)
+
+
+def plot_matches(kpts0, kpts1, color, lw=1.5, ps=4):
+    fig = plt.gcf()
+    ax = fig.axes
+    fig.canvas.draw()
+
+    transFigure = fig.transFigure.inverted()
+    fkpts0 = transFigure.transform(ax[0].transData.transform(kpts0))
+    fkpts1 = transFigure.transform(ax[1].transData.transform(kpts1))
+
+    fig.lines = [matplotlib.lines.Line2D(
+        (fkpts0[i, 0], fkpts1[i, 0]), (fkpts0[i, 1], fkpts1[i, 1]), zorder=1,
+        transform=fig.transFigure, c=color[i], linewidth=lw)
+                 for i in range(len(kpts0))]
+    ax[0].scatter(kpts0[:, 0], kpts0[:, 1], c=color, s=ps)
+    ax[1].scatter(kpts1[:, 0], kpts1[:, 1], c=color, s=ps)
+
+
+def make_matching_plot(image0, image1, kpts0, kpts1, mkpts0, mkpts1,
+                       color, text, path, show_keypoints=False,
+                       fast_viz=False, opencv_display=False,
+                       opencv_title='matches', small_text=[]):
+
+    if fast_viz:
+        make_matching_plot_fast(image0, image1, kpts0, kpts1, mkpts0, mkpts1,
+                                color, text, path, show_keypoints, 10,
+                                opencv_display, opencv_title, small_text)
+        return
+
+    plot_image_pair([image0, image1])
+    if show_keypoints:
+        plot_keypoints(kpts0, kpts1, color='k', ps=4)
+        plot_keypoints(kpts0, kpts1, color='w', ps=2)
+    plot_matches(mkpts0, mkpts1, color)
+
+    fig = plt.gcf()
+    txt_color = 'k' if image0[:100, :150].mean() > 200 else 'w'
+    fig.text(
+        0.01, 0.99, '\n'.join(text), transform=fig.axes[0].transAxes,
+        fontsize=15, va='top', ha='left', color=txt_color)
+
+    txt_color = 'k' if image0[-100:, :150].mean() > 200 else 'w'
+    fig.text(
+        0.01, 0.01, '\n'.join(small_text), transform=fig.axes[0].transAxes,
+        fontsize=5, va='bottom', ha='left', color=txt_color)
+
+    plt.savefig(str(path), bbox_inches='tight', pad_inches=0)
+    plt.close()
+
+
+def make_matching_plot_fast(image0, image1, kpts0, kpts1, mkpts0,
+                            mkpts1, color, text, path=None,
+                            show_keypoints=False, margin=10,
+                            opencv_display=False, opencv_title='',
+                            small_text=[]):
+    H0, W0 = image0.shape
+    H1, W1 = image1.shape
+    H, W = max(H0, H1), W0 + W1 + margin
+
+    out = 255*np.ones((H, W), np.uint8)
+    out[:H0, :W0] = image0
+    out[:H1, W0+margin:] = image1
+    out = np.stack([out]*3, -1)
+
+    if show_keypoints:
+        kpts0, kpts1 = np.round(kpts0).astype(int), np.round(kpts1).astype(int)
+        white = (255, 255, 255)
+        black = (0, 0, 0)
+        for x, y in kpts0:
+            cv2.circle(out, (x, y), 2, black, -1, lineType=cv2.LINE_AA)
+            cv2.circle(out, (x, y), 1, white, -1, lineType=cv2.LINE_AA)
+        for x, y in kpts1:
+            cv2.circle(out, (x + margin + W0, y), 2, black, -1,
+                       lineType=cv2.LINE_AA)
+            cv2.circle(out, (x + margin + W0, y), 1, white, -1,
+                       lineType=cv2.LINE_AA)
+
+    mkpts0, mkpts1 = np.round(mkpts0).astype(int), np.round(mkpts1).astype(int)
+    color = (np.array(color[:, :3])*255).astype(int)[:, ::-1]
+    for (x0, y0), (x1, y1), c in zip(mkpts0, mkpts1, color):
+        c = c.tolist()
+        cv2.line(out, (x0, y0), (x1 + margin + W0, y1),
+                 color=c, thickness=1, lineType=cv2.LINE_AA)
+        # display line end-points as circles
+        cv2.circle(out, (x0, y0), 2, c, -1, lineType=cv2.LINE_AA)
+        cv2.circle(out, (x1 + margin + W0, y1), 2, c, -1,
+                   lineType=cv2.LINE_AA)
+
+    # Scale factor for consistent visualization across scales.
+    sc = min(H / 640., 2.0)
+
+    # Big text.
+    Ht = int(30 * sc)  # text height
+    txt_color_fg = (255, 255, 255)
+    txt_color_bg = (0, 0, 0)
+    for i, t in enumerate(text):
+        cv2.putText(out, t, (int(8*sc), Ht*(i+1)), cv2.FONT_HERSHEY_DUPLEX,
+                    1.0*sc, txt_color_bg, 2, cv2.LINE_AA)
+        cv2.putText(out, t, (int(8*sc), Ht*(i+1)), cv2.FONT_HERSHEY_DUPLEX,
+                    1.0*sc, txt_color_fg, 1, cv2.LINE_AA)
+
+    # Small text.
+    Ht = int(18 * sc)  # text height
+    for i, t in enumerate(reversed(small_text)):
+        cv2.putText(out, t, (int(8*sc), int(H-Ht*(i+.6))), cv2.FONT_HERSHEY_DUPLEX,
+                    0.5*sc, txt_color_bg, 2, cv2.LINE_AA)
+        cv2.putText(out, t, (int(8*sc), int(H-Ht*(i+.6))), cv2.FONT_HERSHEY_DUPLEX,
+                    0.5*sc, txt_color_fg, 1, cv2.LINE_AA)
+
+    if path is not None:
+        cv2.imwrite(str(path), out)
+
+    if opencv_display:
+        cv2.imshow(opencv_title, out)
+        cv2.waitKey(1)
+
+    return out
+
+
+def error_colormap(x):
+    return np.clip(
+        np.stack([2-x*2, x*2, np.zeros_like(x), np.ones_like(x)], -1), 0, 1)
+
+
+########################################
+
+# main.py içeriği:
+
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import argparse
+import zipfile
+import io
+import shutil
+import csv
+from urllib.request import urlopen
+from urllib.error import URLError, HTTPError
+from moduls.camera import load_camera_params, load_superglue_model
+from moduls.data_processing import process_imu_data, preprocess_imu_data
+from moduls.visualization import visualize_results, visualize_error, visualize_superglue
+from moduls.confidence_estimation import quadratic_unit_step, cubic_unit_step, quartic_unit_step, relu, double_exponential_sigmoid, triple_exponential_sigmoid, quadruple_exponential_sigmoid, step
+
+DEFAULT_DATASET = "EurocMav"
+DEFAULT_SEQUENCE = "MH_03_medium"
+
+BASE_URLS = {
+    "machine_hall": "http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/machine_hall/",
+    "vicon_room1": "http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/vicon_room1/",
+    "vicon_room2": "http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/vicon_room2/"
+}
+
+SEQUENCE_PREFIXES = {
+    "MH": "machine_hall",
+    "V1": "vicon_room1",
+    "V2": "vicon_room2"
+}
+
+def get_base_url(sequence_name):
+    prefix = sequence_name[:2]
+    return BASE_URLS.get(SEQUENCE_PREFIXES.get(prefix))
+
+def validate_sequence_name(sequence_name):
+    valid_prefixes = ["MH_", "V1_", "V2_"]
+    return any(sequence_name.startswith(prefix) for prefix in valid_prefixes)
+
+def download_dataset(sequence_name, dataset_path):
+    if not validate_sequence_name(sequence_name):
+        print(f"Error: Invalid sequence name {sequence_name}. Must start with MH_, V1_, or V2_")
+        return False
+
+    base_url = get_base_url(sequence_name)
+    if not base_url:
+        print(f"Error: Could not determine base URL for sequence {sequence_name}")
+        return False
+
+    download_url = f"{base_url}{sequence_name}/{sequence_name}.zip"
+    zip_path = Path(dataset_path) / f"{sequence_name}.zip"
+    extract_path = Path(dataset_path) / sequence_name
+    
+    print(f"Attempting to download from: {download_url}")
+    
+    try:
+        with urlopen(download_url) as response:
+            total_size = int(response.info().get('Content-Length', -1))
+            
+            if total_size < 0:
+                print("Unable to determine file size. Downloading without progress indication.")
+                data = response.read()
+            else:
+                data = io.BytesIO()
+                with tqdm(total=total_size, unit='B', unit_scale=True, desc="Downloading") as pbar:
+                    while True:
+                        chunk = response.read(8192)
+                        if not chunk:
+                            break
+                        data.write(chunk)
+                        pbar.update(len(chunk))
+                data = data.getvalue()
+
+            print("\nDownload complete. Saving and verifying file...")
+            
+            with open(zip_path, 'wb') as f:
+                f.write(data)
+            
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    print("File verified as a valid zip file. Extracting...")
+                    zf.extractall(extract_path)
+                print("Extraction complete.")
+                return True
+            except zipfile.BadZipFile:
+                print("Error: Downloaded file is not a valid zip file.")
+                return False
+    
+    except HTTPError as e:
+        print(f"HTTP Error during download: {e.code} {e.reason}")
+        return False
+    except URLError as e:
+        print(f"URL Error during download: {e.reason}")
+        return False
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return False
+
+def process_dataset(base_path, config, sequence_name):
+    imu_file_path = base_path / 'imu0' / 'data.csv'
+    camera_file_path = base_path / 'cam0' / 'data.csv'
+    camera_data_path = base_path / 'cam0' / 'data'
+    camera_yaml_path = base_path / 'cam0' / 'sensor.yaml'
+
+    # Check if all required files exist
+    required_files = [imu_file_path, camera_file_path, camera_yaml_path]
+    for file in required_files:
+        if not file.exists():
+            print(f"Required file not found: {file}")
+            return None
+
+    if not camera_data_path.exists():
+        print(f"Camera data directory not found: {camera_data_path}")
+        return None
+
+    print("Preprocessing IMU data...")
+    preprocess_imu_data(base_path)
+
+    imu_with_groundtruth_path = base_path / 'imu0' / 'imu_with_interpolated_groundtruth.csv'
+    
+    try:
+        return process_imu_data(
+            str(imu_with_groundtruth_path),
+            str(camera_file_path),
+            str(camera_data_path),
+            str(camera_yaml_path),
+            config,
+            sequence_name,
+            verbose=True
+        )
+    except Exception as e:
+        print(f"Error processing data: {e}")
+        return None
+
+def main(args):
+    if not validate_sequence_name(args.sequence):
+        print("Error: Invalid sequence name format. Must start with MH_, V1_, or V2_")
+        return
+
+    dataset_path = Path(args.dataset_path)
+    sequence_path = dataset_path / args.sequence
+    
+    if args.download or not sequence_path.exists():
+        success = download_dataset(args.sequence, dataset_path)
+        if not success:
+            print("Failed to download or extract the dataset. Exiting.")
+            return
+
+    base_path = sequence_path / 'mav0'
+    
+    if not base_path.exists():
+        print(f"Dataset structure not found at {base_path}. Please check the dataset path.")
+        return
+
+    activation_functions = {
+        'quadratic_unit_step': quadratic_unit_step,
+        'cubic_unit_step': cubic_unit_step,
+        'quartic_unit_step': quartic_unit_step,
+        'relu': relu,
+        'double_exponential_sigmoid': double_exponential_sigmoid,
+        'triple_exponential_sigmoid': triple_exponential_sigmoid,
+        'quadruple_exponential_sigmoid': quadruple_exponential_sigmoid,
+        'step': step
+    }
+
+    config = {
+        'alpha': args.alpha,
+        'beta': args.beta,
+        'gamma': args.gamma,
+        'theta_threshold': args.theta_threshold,
+        'activation_func': activation_functions[args.activation_function],
+        'generate_superglue_visualizations': args.generate_superglue_visualizations,
+        'superglue': {
+            'weights': 'indoor',
+            'sinkhorn_iterations': 20,
+            'match_threshold': 0.2,
+            'keypoint_threshold': 0.005,
+            'max_keypoints': 1000,
+            'nms_radius': 4
+        },
+        'superglue_visualization': {
+            'frame_interval': 10,
+            'max_pairs': 5000
+        }
+    }
+
+    result = process_dataset(base_path, config, args.sequence)
+    if result is None:
+        return
+
+    (data, aligned_quaternions, aligned_euler_angles, true_quaternions, 
+     true_euler_angles, rmse_quaternions, rmse_euler_angles, thetas, timestamps) = result
+
+    print("Quaternion RMSE:", rmse_quaternions)
+    print("Euler Angle RMSE:", rmse_euler_angles)
+    
+    # Save results to CSV
+    output_file = f'{args.sequence}_estimated_values.csv'
+    with open(output_file, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Timestamp', 'q_w', 'q_x', 'q_y', 'q_z', 'roll', 'pitch', 'yaw', 'theta'])
+        for t, q, e, theta in zip(timestamps, aligned_quaternions, aligned_euler_angles, thetas):
+            writer.writerow([t] + list(q) + list(e) + [theta])
+    print(f"Estimated values saved to {output_file}")
+    
+    print("Generating visualizations...")
+    visualize_results(data, aligned_quaternions, aligned_euler_angles, 
+                     true_quaternions, true_euler_angles, rmse_quaternions, 
+                     rmse_euler_angles, thetas, args.sequence)
+    
+    visualize_error(data, aligned_quaternions, aligned_euler_angles, 
+                   true_quaternions, true_euler_angles, thetas, args.sequence)
+    
+    if config['generate_superglue_visualizations']:
+        print("Generating SuperGlue visualizations...")
+        superglue_output_dir = f'super-out_{args.sequence}'
+        visualize_superglue(base_path, superglue_output_dir, config)
+    
+    print("Processing completed successfully.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Visual Inertial Odometry Processing")
+    parser.add_argument("--dataset_path", type=str, default=".", 
+                       help="Path to save the dataset (default: current directory)")
+    parser.add_argument("--sequence", type=str, default=DEFAULT_SEQUENCE,
+                       help="Dataset sequence to use (e.g., MH_03_medium, V1_01_easy, V2_02_medium)")
+    parser.add_argument("--download", action="store_true", 
+                       help="Force download the dataset even if it exists")
+    parser.add_argument("--alpha", type=float, default=1, 
+                       help="Alpha parameter (default: 1)")
+    parser.add_argument("--beta", type=float, default=1, 
+                       help="Beta parameter (default: 1)")
+    parser.add_argument("--gamma", type=float, default=1, 
+                       help="Gamma parameter (default: 1)")
+    parser.add_argument("--theta_threshold", type=float, default=0.30, 
+                       help="Theta threshold (default: 0.30)")
+    parser.add_argument("--activation_function", type=str, 
+                       choices=['quadratic_unit_step', 'cubic_unit_step', 'quartic_unit_step',
+                               'relu', 'double_exponential_sigmoid', 'triple_exponential_sigmoid',
+                               'quadruple_exponential_sigmoid', 'step'], 
+                       default='double_exponential_sigmoid', 
+                       help="Activation function to use (default: double_exponential_sigmoid)")
+    parser.add_argument("--generate_superglue_visualizations", action="store_true",
+                       help="Generate SuperGlue visualizations")
+    
+    args = parser.parse_args()
+    main(args)
+
+
+########################################
+
