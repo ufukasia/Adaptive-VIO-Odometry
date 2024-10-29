@@ -315,7 +315,7 @@ def visualize_error(data, aligned_quaternions, aligned_euler_angles, estimated_v
     plt.show()
 
 if __name__ == "__main__":
-    file_path = 'MH_04_difficult/mav0/imu0/imu_with_interpolated_groundtruth.csv'
+    file_path = 'MH_03_medium/mav0/imu0/imu_with_interpolated_groundtruth.csv'
 
     data, aligned_quaternions, aligned_euler_angles, estimated_velocities, true_quaternions, true_euler_angles, true_velocities, rmse_quaternions, rmse_euler_angles, rmse_velocities = process_imu_data(file_path)
 
