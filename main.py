@@ -230,12 +230,12 @@ if __name__ == "__main__":
                        help="Force download the dataset even if it exists")
     parser.add_argument("--alpha", type=float, default=1, 
                        help="Alpha parameter (default: 1)")
-    parser.add_argument("--beta", type=float, default=1, 
-                       help="Beta parameter (default: 1)")
+    parser.add_argument("--beta", type=float, default=0.8, 
+                       help="Beta parameter (default: 0.8)")
     parser.add_argument("--gamma", type=float, default=1, 
                        help="Gamma parameter (default: 1)")
-    parser.add_argument("--theta_threshold", type=float, default=0.30, 
-                       help="Theta threshold (default: 0.30)")
+    parser.add_argument("--theta_threshold", type=float, default=0.25, 
+                       help="Theta threshold (default: 0.25)")
     parser.add_argument("--activation_function", type=str, 
                        choices=['quadratic_unit_step', 'cubic_unit_step', 'quartic_unit_step',
                                'relu', 'double_exponential_sigmoid', 'triple_exponential_sigmoid',
