@@ -16,7 +16,7 @@ def convert_quaternion_order(q_wxyz):
     return np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]])
 
 class ExtendedKalmanFilter:
-    def __init__(self, initial_quaternion, initial_velocity, gravity_vector, calibrated_gravity_vector):
+    def __init__(self, initial_quaternion, initial_velocity, gravity_vector):
         initial_quaternion_xyzw = convert_quaternion_order(initial_quaternion)
         
         self.q = initial_quaternion  # [w, x, y, z] order
@@ -26,18 +26,11 @@ class ExtendedKalmanFilter:
         self.Q = np.diag([1e-10, 1e-10, 1e-10, 1e-10, 1e-10, 1e-10, 1e-10])   # Process noise
         self.R = np.diag([2000, 2000, 2000])  # Measurement noise for accelerometer only
         self.g = gravity_vector
-        self.calibrated_gravity_vector = calibrated_gravity_vector     # Kalibrasyondan gelen sapma vektörü
 
     def update(self, gyroscope, accelerometer, dt):
         q = self.state[:4]  # [w, x, y, z]
         v = self.state[4:]
         self.P = self.P + self.Q
-
-        # Ivmeölçer ölçümünden kalibrasyon sapmasını çıkarın
-        accelerometer_corrected = accelerometer - self.calibrated_gravity_vector
-
-        if np.all(accelerometer_corrected == 0):
-            return self.state
 
         # Prediction step
         qdot = 0.5 * np.array([
@@ -54,7 +47,7 @@ class ExtendedKalmanFilter:
         q_pred_xyzw = convert_quaternion_order(q_pred)
         R_pred = R.from_quat(q_pred_xyzw).as_matrix()
 
-        a_global = R_pred @ accelerometer_corrected + self.g
+        a_global = R_pred @ accelerometer + self.g
         v_pred = v + a_global * dt
 
         state_pred = np.concatenate([q_pred, v_pred])
@@ -64,7 +57,7 @@ class ExtendedKalmanFilter:
         z_pred = a_pred
 
         # Compute residual
-        z = accelerometer_corrected  # Measured specific force
+        z = accelerometer  # Measured specific force
         y = z - z_pred
 
         # Compute Jacobian H for accelerometer only (orientation)
@@ -170,10 +163,9 @@ def process_imu_data(file_path):
 
     # Known gravity vector (global frame)
     gravity_vector = np.array([0, 0, -9.81])  # Standart yerçekimi vektörü
-    calibrated_gravity_vector = np.array([-0.2, -0.2, -0.3])#-02-02-03
 
     # Create EKF
-    ekf = ExtendedKalmanFilter(initial_quaternion=initial_quaternion, initial_velocity=initial_velocity, gravity_vector=gravity_vector, calibrated_gravity_vector=calibrated_gravity_vector)
+    ekf = ExtendedKalmanFilter(initial_quaternion=initial_quaternion, initial_velocity=initial_velocity, gravity_vector=gravity_vector)
 
     # Initialize lists
     estimated_states = []
