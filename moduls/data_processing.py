@@ -179,15 +179,19 @@ def preprocess_imu_data(base_path, cam_to_imu_timeshift=5.63799926987e-05):
         groundtruth_df.set_index('#timestamp', inplace=True)
         groundtruth_df.sort_index(inplace=True)
         
-        velocity_cols = [' v_RS_R_x [m s^-1]', ' v_RS_R_y [m s^-1]', ' v_RS_R_z [m s^-1]']
-        quaternion_cols = [' q_RS_w []', ' q_RS_x []', ' q_RS_y []', ' q_RS_z []']
+        # Tüm sayısal sütunları seç
+        numeric_cols = groundtruth_df.select_dtypes(include=[np.number]).columns.tolist()
+        # Timestamp sütununu çıkart (eğer varsa)
+        numeric_cols = [col for col in numeric_cols if col != '#timestamp']
         
         # Zaman kayması düzeltilmiş timestamp'leri kullanarak interpolasyon
-        for col in velocity_cols + quaternion_cols:
+        for col in numeric_cols:
             if col in groundtruth_df.columns:
-                imu_df[col] = np.interp(imu_df['#timestamp [ns]'], 
-                                      groundtruth_df.index.values,
-                                      groundtruth_df[col].values)
+                imu_df[col] = np.interp(
+                    imu_df['#timestamp [ns]'],
+                    groundtruth_df.index.values,
+                    groundtruth_df[col].values
+                )
         
         output_file = base_path / 'imu0/imu_with_interpolated_groundtruth.csv'
         imu_df.to_csv(output_file, index=False)
@@ -199,6 +203,7 @@ def preprocess_imu_data(base_path, cam_to_imu_timeshift=5.63799926987e-05):
     except Exception as e:
         print(f"An error occurred during preprocessing: {e}")
         raise
+
 
 if __name__ == "__main__":
     print("This module is not meant to be run directly. Please use main.py instead.")
