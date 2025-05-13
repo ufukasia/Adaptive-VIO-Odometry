@@ -1,8 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
 
-# --- Orijinal fonksiyonlar ---------------------------------------------------
+# --- Aktivasyon fonksiyonları ------------------------------------------------
 
 def relu(x):
     return np.maximum(0, x)
@@ -10,56 +9,62 @@ def relu(x):
 def step(x):
     return np.where(x >= 0, 1, 0)
 
-# --- Parametreli exp_unit ----------------------------------------------------
-
-def exp_unit(x, a):
-    x_clip = np.minimum(x, 1.0)
+def casef(x, a):
+    """
+    Clipped Adaptive Saturation Exponential Function (CASEF)
+    Negatif girdilerde 0, 0–1 aralığında üssel olarak ölçeklenir,
+    1 üzerindeki girdilerde doygunluk (saturasyon) ile 1 değerini alır.
+    """
+    x_clip = np.clip(x, 0.0, 1.0)
     return (np.exp(a * x_clip) - 1) / (np.exp(a) - 1)
 
-# --- Çizdirilecek aktivasyon fonksiyonları -----------------------------------
+def exponential_surge(x):
+    return np.piecewise(
+        x,
+        [x < 0, (x >= 0) & (x <= 1), x > 1],
+        [0, lambda x: 1 - (1 - x) ** 5, 1]
+    )
 
-# Burada istediğiniz a değerlerini ekleyin:
-a_values = [4, -4]
+def quartic_unit_step(x):
+    return np.minimum(x**4, 1)
 
-# activation_functions listesini otomatik oluşturuyoruz:
-activation_functions = []
+# --- Parametreler -----------------------------------------------------------
 
-# exp_unit varyantları:
-for a in a_values:
-    func = lambda x, a=a: exp_unit(x, a)
-    name = f"Exp Unit (a={a})"
-    activation_functions.append((func, name, (-0.1, 1)))
-
-# Diğer fonksiyonlar:
-activation_functions += [
-    (relu, "ReLU", (-1, 5)),
-    (step, "Step", (-1, 2))
+# İlk satırda 4 "klasik" fonksiyon
+top_functions = [
+    (quartic_unit_step,     "Quartic Unit Step"),
+    (relu,                  "ReLU"),
+    (exponential_surge,     "Exponential Surge"),
+    (step,                  "Step"),
 ]
 
-# Renk paleti (fonksiyon sayısına yetecek uzunlukta olsun):
-colors = ['#0000FF', '#FAAF00', '#FF00FF', '#228B22', '#8A2BE2', '#FF1493', '#FFA500']
+# Alt satırda 4 farklı CASEF varyantı
+a_values = [4, 0.01, -4, -300]
+bottom_functions = [
+    (lambda x, a=a: casef(x, a), f"CASEF (a={a})")
+    for a in a_values
+]
 
-# --- Çizim -------------------------------------------------------------------
+# Renkler (toplam 8 adet)
+colors = [
+    '#0000FF', '#FAAF00', '#FF00FF', '#228B22',
+    '#8A2BE2', '#FF1493', '#FFA500', '#00CED1'
+]
 
-fig = plt.figure(figsize=(22, 6), constrained_layout=True)
-gs = GridSpec(1, len(activation_functions), figure=fig)
+# --- Grafik çizimi ---------------------------------------------------------
 
-for i, ((func, name, (x_min, x_max)), color) in enumerate(zip(activation_functions, colors)):
-    ax = fig.add_subplot(gs[0, i])
-    x = np.linspace(x_min, x_max, 1000)
+fig, axes = plt.subplots(2, 4, figsize=(22, 8), constrained_layout=True)
+
+for idx, (func, name) in enumerate(top_functions + bottom_functions):
+    ax = axes[idx // 4, idx % 4]
+    x = np.linspace(-0.1, 1, 1000)
     y = func(x)
-    
-    ax.plot(x, y, label=name, color=color, linewidth=2)
+
+    ax.plot(x, y, label=name, color=colors[idx], linewidth=2)
     ax.axhline(0, color='k', linestyle='--', linewidth=0.5)
     ax.axvline(0, color='k', linestyle='--', linewidth=0.5)
-    ax.set_xlim(x_min, x_max)
-
-    # Tüm fonksiyonları 0-1 aralığına sabitlemek istiyorsanız burayı açabilir
-    # ax.set_ylim(-0.1, 1.1)
-    # Aksi halde otomatik sınır:
-    y_min, y_max = y.min(), y.max()
-    y_range = y_max - y_min
-    ax.set_ylim(y_min - 0.1*y_range, y_max + 0.1*y_range)
+    ax.set_xlim(-0.1, 1.01)
+    ax.set_ylim(-0.1, 1.01)
 
     ax.set_title(name, fontsize=11, fontweight='bold')
     ax.set_xlabel('x', fontsize=9)
@@ -67,6 +72,5 @@ for i, ((func, name, (x_min, x_max)), color) in enumerate(zip(activation_functio
     ax.tick_params(axis='both', which='major', labelsize=8)
     ax.grid(True, linestyle=':', alpha=0.6)
 
-#plt.suptitle('Aktivasyon Fonksiyonları ve Alternatifler', fontsize=22, fontweight='bold')
-plt.savefig('activation_functions_alternatives.png', dpi=300, bbox_inches='tight')
+plt.savefig('activation_functions_2rows.png', dpi=300, bbox_inches='tight')
 plt.show()
